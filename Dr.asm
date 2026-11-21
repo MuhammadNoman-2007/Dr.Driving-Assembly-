@@ -1,10 +1,15 @@
 ; =====================================================================
 ;  DR. DRIVING LITE  -  COAL Final Project  (8088 assembly, NASM, .COM)
 ;  Build :  nasm drdriving.asm -o drdriving.com
-;  Only techniques from the course book are used:
-;    - BIOS video services (INT 10h: mode 0Dh, write pixel)
-;    - hooked keyboard (INT 9) and timer (INT 8) interrupts, PIT, ports
-;    - string instructions (STOS, CMPS), stack parameters, tables
+;
+;  Only 8088 instructions and techniques from the course book are used:
+;    - BIOS video service (INT 10h, mode 13h), VGA colour registers (ports)
+;    - hooked keyboard (INT 9) and timer (INT 8) interrupts, the PIT
+;    - DOS file services (INT 21h) to keep your points and cars
+;    - string instructions (STOS, MOVS, CMPS), stack parameters, tables
+;
+;  Menu: UP / DOWN / ENTER.  Game: UP gas, SPACE brake, DOWN reverse,
+;  LEFT / RIGHT lanes (steer), C camera, ESC pause menu.
 ; =====================================================================
 cpu 8086
 bits 16
@@ -24,16 +29,6 @@ bits 16
         PUSHV %5
         call fillrect
 %endmacro
-
-; rounded rectangle scratch (shared by the renderer)
-rr_x: dw 0
-rr_y: dw 0
-rr_w: dw 0
-rr_h: dw 0
-rr_col: db 0
-rr_r: dw 0
-rr_cx: dw 0
-rr_cy: dw 0
 
 ; ---------------------------------------------------------------- data
 bseg:       dw 0                ; segment of the back buffer (frame being drawn)
@@ -88,6 +83,9 @@ dtab36: times 37 db 0
 dtab11: times 12 db 0
 dtab9:  times 10 db 0
 dtab3:  times 4 db 0
+dtab10: times 11 db 0
+dtab8:  times 9 db 0
+dtab6:  times 7 db 0
 
 ; ------------------------------------------------------- interrupt routines
 ; keyboard: keeps a table of which keys are down (make code = down, break = up)
@@ -156,6 +154,8 @@ start:
         mov  ax, 0x0013
         int  0x10
         call setpal
+        call build_invmap
+        call load_game
         call game_init
         mov  ax, [ticks]
         mov  [lasttick], ax
@@ -167,7 +167,16 @@ mainloop:
         mov  cx, ax
         sub  cx, [lasttick]
         mov  [lasttick], ax
-        cmp  cx, 3
+        cmp  cx, 2
+        jb   ml_fast
+        inc  byte [slow]         ; a frame took longer than a tick
+        cmp  byte [slow], 40
+        jb   ml_cap
+        mov  byte [autooff], 1   ; too slow for the edge smoothing: pause it
+        mov  byte [slow], 0
+        jmp  ml_cap
+ml_fast: mov byte [slow], 0
+ml_cap: cmp  cx, 3
         jbe  ml_steps
         mov  cx, 3               ; never run more than 3 logic steps per frame
 ml_steps:
@@ -248,6 +257,15 @@ it1:    mov  [di], ax
         mov  si, dtab3
         mov  cx, 3
         call build_disc
+        mov  si, dtab10
+        mov  cx, 10
+        call build_disc
+        mov  si, dtab8
+        mov  cx, 8
+        call build_disc
+        mov  si, dtab6
+        mov  cx, 6
+        call build_disc
         ret
 
 ; build_disc: si = table, cx = radius. table[dy] = half width of the
@@ -286,11 +304,14 @@ bd_ok:  push si
         pop  ax
         ret
 
-; ------------------------------------- show the frame: the finished
-; picture is copied to video memory (segment A000) in one go
+; ------------------------------------------------------ video memory
+; present: the finished picture is copied to video memory (segment A000);
+; with smoothing on, the stair steps of slanted and round edges are then
+; softened by blending the two pixels that meet at an edge
 present:
         push ds
         push es
+        push bp
         mov  ax, [bseg]
         mov  ds, ax
         mov  ax, 0xA000
@@ -299,25 +320,192 @@ present:
         xor  di, di
         mov  cx, 32000
         rep  movsw
+        pop  bp
+        pop  es
+        pop  ds
+        cmp  byte [smooth], 0
+        je   pr_x
+        cmp  byte [autooff], 0
+        jne  pr_x
+        call smooth_edges
+pr_x:   ret
+
+; blend12: bx = colour a, ax = colour b (packed 4+4+4 bit r,g,b)  ->  ax = average
+blend12:
+        push cx
+        mov  cx, bx
+        and  cx, ax
+        xor  ax, bx
+        shr  ax, 1
+        and  ax, 0x0777
+        add  ax, cx
+        pop  cx
+        ret
+
+; aa_pair: the pixels at [si-1] and [di-1] of the picture meet at an edge.
+; 3/4 of their own colour and 1/4 of the neighbour is written to the screen.
+aa_pair:
+        mov  al, [si-1]
+        mov  ah, [di-1]
+        mov  cl, al
+        sub  cl, ah
+        jnc  ap1
+        neg  cl
+ap1:    cmp  cl, 2               ; neighbours in the same gradient: leave
+        jbe  ap_x
+        mov  dx, 0xA000
+        mov  es, dx
+        mov  al, [es:si-1]
+        mov  ah, [es:di-1]
+        xor  bh, bh
+        mov  bl, al
+        shl  bx, 1
+        mov  dx, [cs:rgb12+bx]
+        mov  [cs:aa_rp], dx
+        xor  bh, bh
+        mov  bl, ah
+        shl  bx, 1
+        mov  dx, [cs:rgb12+bx]
+        mov  [cs:aa_rq], dx
+        mov  bx, [cs:aa_rp]
+        mov  ax, [cs:aa_rq]
+        call blend12
+        mov  [cs:aa_m], ax
+        mov  bx, [cs:aa_rp]
+        call blend12             ; ax = 3/4 p + 1/4 q
+        mov  bx, ax
+        mov  al, [cs:invmap+bx]
+        mov  [es:si-1], al
+        mov  bx, [cs:aa_rq]
+        mov  ax, [cs:aa_m]
+        call blend12
+        mov  bx, ax
+        mov  al, [cs:invmap+bx]
+        mov  [es:di-1], al
+        mov  es, bp
+ap_x:   ret
+
+smooth_edges:
+        push ds
+        push es
+        push bp
+        mov  bp, [bseg]
+        mov  ds, bp
+        mov  es, bp
+        ; pairs side by side
+        xor  si, si
+sm_row: mov  di, si
+        inc  di
+        mov  cx, 319
+sm_h:   repe cmpsb
+        jz   sm_hn
+        push cx
+        push si
+        push di
+        call aa_pair
+        pop  di
+        pop  si
+        pop  cx
+        or   cx, cx
+        jnz  sm_h
+sm_hn:  mov  si, di
+        cmp  si, 64000
+        jb   sm_row
+        ; pairs on top of each other
+        xor  si, si
+        mov  di, 320
+        mov  cx, 63680
+sm_v:   repe cmpsb
+        jz   sm_end
+        push cx
+        push si
+        push di
+        call aa_pair
+        pop  di
+        pop  si
+        pop  cx
+        or   cx, cx
+        jnz  sm_v
+sm_end: pop  bp
         pop  es
         pop  ds
         ret
 
+slow:   db 0
+autooff: db 0
+aa_rp: dw 0
+aa_rq: dw 0
+aa_m:  dw 0
+invmap: times 4096 db 0
+rgb12:  times 256 dw 0
+
 ; ---------------------------------------------- colour gradients (VGA DAC)
-; each entry: first colour, how many, start r,g,b, end r,g,b (0..63)
+; the 16 basic colours (r,g,b in 0..63)
+ega_tab:
+        db 0,0,0,      10,14,40,   10,36,16,   10,40,44
+        db 44,6,8,     34,12,40,   40,22,6,    40,42,46
+        db 20,22,26,   26,40,63,   28,58,32,   30,58,63
+        db 63,26,22,   58,28,58,   63,58,20,   63,63,63
+; each gradient: first colour, how many, start r,g,b, end r,g,b
 pal_defs:
-        db 16,66,  8,30,58,  50,58,63     ; sky: deep blue at the top, pale at the horizon
-        db 84,32,  30,30,34, 12,12,14     ; asphalt (far = light, near = dark)
-        db 116,32, 36,36,40, 17,17,19     ; asphalt, second stripe
-        db 148,32, 44,44,46, 52,52,54     ; pavement
-        db 180,32, 38,38,40, 45,45,47     ; pavement, second stripe
-        db 212,32, 63,46,16, 28,9,3       ; orange bonnet
-        db 244,2,  34,44,56, 34,44,56     ; distant haze
-        db 246,2,  24,32,46, 24,32,46     ; nearer haze
+        db 16,22,  6,26,56,   46,56,63    ; sky (22 bands)
+        db 38,24,  30,31,35,  11,12,14    ; asphalt, far = light ... near = dark
+        db 62,24,  35,36,40,  15,16,18    ; asphalt, second stripe
+        db 86,16,  42,43,46,  50,51,54    ; pavement
+        db 102,16, 39,40,43,  47,48,51    ; pavement, second stripe
+        db 118,12, 28,10,2,   63,50,22    ; paint 0  orange
+        db 130,12, 6,10,30,   36,48,63    ; paint 1  blue
+        db 142,12, 28,2,4,    63,28,26    ; paint 2  red
+        db 154,12, 4,22,10,   34,58,40    ; paint 3  green
+        db 166,12, 34,26,2,   63,60,26    ; paint 4  yellow
+        db 178,12, 14,15,18,  63,63,63    ; paint 5  silver
+        db 190,12, 3,5,14,    30,44,60    ; glass
+        db 202,4,  30,40,52,  18,26,38    ; haze (distant buildings)
+        db 206,16, 2,2,3,     40,41,44    ; dashboard greys
+        db 222,4,  5,5,7,     14,14,16    ; soft shadow
+        db 226,8,  30,16,2,   63,52,10    ; gold
+        db 234,16, 4,6,16,    16,24,52    ; night blue (panels, garage)
+        db 250,6,  24,26,30,  62,62,64    ; chrome
         db 0
 rp_s: db 0
 rp_n: dw 0
 rp_c: times 6 db 0
+rp_v: times 3 db 0
+
+; setcol: ax = colour number, rp_v = r,g,b  ->  DAC and our own copy
+setcol: push ax
+        push bx
+        push cx
+        push dx
+        mov  bx, ax
+        mov  dx, 0x3C8
+        out  dx, al
+        inc  dx
+        mov  al, [rp_v]
+        out  dx, al
+        mov  al, [rp_v+1]
+        out  dx, al
+        mov  al, [rp_v+2]
+        out  dx, al
+        mov  cl, 2
+        mov  al, [rp_v]
+        shr  al, cl
+        mov  ah, al              ; ah = red / 4
+        mov  al, [rp_v+1]
+        shr  al, cl
+        mov  cl, 4
+        shl  al, cl
+        mov  dl, [rp_v+2]
+        mov  cl, 2
+        shr  dl, cl
+        or   al, dl              ; al = green * 16 + blue
+        shl  bx, 1
+        mov  [rgb12+bx], ax
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
 
 setpal: push ax
         push bx
@@ -325,6 +513,19 @@ setpal: push ax
         push dx
         push si
         push di
+        mov  si, ega_tab
+        xor  bx, bx
+pl_e:   lodsb
+        mov  [rp_v], al
+        lodsb
+        mov  [rp_v+1], al
+        lodsb
+        mov  [rp_v+2], al
+        mov  ax, bx
+        call setcol
+        inc  bx
+        cmp  bx, 16
+        jb   pl_e
         mov  si, pal_defs
 pl_def: lodsb
         or   al, al
@@ -340,11 +541,7 @@ pl_cp:  lodsb
         inc  di
         loop pl_cp
         xor  bx, bx
-pl_i:   mov  al, [rp_s]
-        add  al, bl
-        mov  dx, 0x3C8
-        out  dx, al
-        xor  di, di
+pl_i:   xor  di, di
 pl_c:   mov  al, [rp_c+di+3]
         sub  al, [rp_c+di]
         cbw
@@ -353,11 +550,14 @@ pl_c:   mov  al, [rp_c+di+3]
         dec  cx
         idiv cx
         add  al, [rp_c+di]
-        mov  dx, 0x3C9
-        out  dx, al
+        mov  [rp_v+di], al
         inc  di
         cmp  di, 3
         jb   pl_c
+        xor  ah, ah
+        mov  al, [rp_s]
+        add  ax, bx
+        call setcol
         inc  bx
         cmp  bx, [rp_n]
         jb   pl_i
@@ -365,6 +565,195 @@ pl_c:   mov  al, [rp_c+di+3]
 pl_end: pop  di
         pop  si
         pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; build_invmap: for every colour of a 16 x 16 x 16 colour cube, the number of
+; the closest palette entry (palette entries are marked first, then the
+; empty cells are filled from their neighbours)
+build_invmap:
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        push es
+        push ds
+        pop  es
+        mov  di, invd
+        mov  cx, 2048
+        xor  ax, ax
+        rep  stosw
+        xor  bx, bx
+bi1:    mov  si, bx
+        shl  si, 1
+        mov  si, [rgb12+si]
+        cmp  byte [invd+si], 0
+        jne  bi2
+        mov  byte [invd+si], 1
+        mov  ax, bx
+        mov  [invmap+si], al
+bi2:    inc  bx
+        cmp  bx, 256
+        jb   bi1
+        mov  byte [bi_pass], 2
+bi3:    xor  dx, dx              ; cells filled in this pass
+        xor  si, si
+bi4:    cmp  byte [invd+si], 0
+        jne  bi9
+        mov  ax, si
+        and  ax, 15
+        jz   bi5
+        mov  bx, si
+        dec  bx
+        call bi_try
+        jc   bi8
+bi5:    mov  ax, si
+        and  ax, 15
+        cmp  ax, 15
+        je   bi6
+        mov  bx, si
+        inc  bx
+        call bi_try
+        jc   bi8
+bi6:    mov  ax, si
+        and  ax, 0xF0
+        jz   bi7
+        mov  bx, si
+        sub  bx, 16
+        call bi_try
+        jc   bi8
+bi7:    mov  ax, si
+        and  ax, 0xF0
+        cmp  ax, 0xF0
+        je   bi7a
+        mov  bx, si
+        add  bx, 16
+        call bi_try
+        jc   bi8
+bi7a:   cmp  si, 256
+        jb   bi7b
+        mov  bx, si
+        sub  bx, 256
+        call bi_try
+        jc   bi8
+bi7b:   cmp  si, 3840
+        jae  bi9
+        mov  bx, si
+        add  bx, 256
+        call bi_try
+        jc   bi8
+        jmp  bi9
+bi8:    mov  [invmap+si], al
+        mov  al, [bi_pass]
+        mov  [invd_new], al      ; remember that this cell is new
+        mov  [invnew+si], al
+        inc  dx
+bi9:    inc  si
+        cmp  si, 4096
+        jb   bi4
+        or   dx, dx
+        jz   bi_x
+        ; cells filled in this pass become usable for the next one
+        xor  si, si
+bi10:   mov  al, [invnew+si]
+        or   al, al
+        jz   bi11
+        mov  [invd+si], al
+        mov  byte [invnew+si], 0
+bi11:   inc  si
+        cmp  si, 4096
+        jb   bi10
+        inc  byte [bi_pass]
+        jmp  bi3
+bi_x:   pop  es
+        pop  di
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; bi_try: cell bx was filled in an earlier pass?  carry set and al = colour
+bi_try: cmp  byte [invd+bx], 0
+        je   bt_no
+        mov  al, [invd+bx]
+        cmp  al, [bi_pass]
+        jae  bt_no
+        mov  al, [invmap+bx]
+        stc
+        ret
+bt_no:  clc
+        ret
+
+bi_pass: db 2
+invd_new: db 0
+invd:    times 4096 db 0
+invnew:  times 4096 db 0
+
+; ------------------------------------------------ saved game (DOS files)
+savefile: db "DRDRIVE.SAV",0
+sv_sig:   db 0
+bank:     dw 0                  ; points collected
+unl:      db 1                  ; bit mask of the unlocked cars
+selcar:   db 0
+usercam:  db 1
+smooth:   db 1
+sv_end:
+SAVELEN   equ 7
+
+save_game:
+        push ax
+        push bx
+        push cx
+        push dx
+        mov  byte [sv_sig], 0xD5
+        mov  dx, savefile
+        xor  cx, cx
+        mov  ah, 0x3C            ; create file
+        int  0x21
+        jc   sv_x
+        mov  bx, ax
+        mov  dx, sv_sig
+        mov  cx, SAVELEN
+        mov  ah, 0x40            ; write
+        int  0x21
+        mov  ah, 0x3E            ; close
+        int  0x21
+sv_x:   pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+load_game:
+        push ax
+        push bx
+        push cx
+        push dx
+        mov  dx, savefile
+        mov  ax, 0x3D00          ; open for reading
+        int  0x21
+        jc   ld_x
+        mov  bx, ax
+        mov  dx, sv_sig
+        mov  cx, SAVELEN
+        mov  ah, 0x3F            ; read
+        int  0x21
+        mov  ah, 0x3E
+        int  0x21
+        cmp  byte [sv_sig], 0xD5
+        je   ld_x
+        mov  word [bank], 0      ; not our file: start from scratch
+        mov  byte [unl], 1
+        mov  byte [selcar], 0
+        mov  byte [usercam], 1
+        mov  byte [smooth], 1
+ld_x:   pop  dx
         pop  cx
         pop  bx
         pop  ax
@@ -501,134 +890,6 @@ fr_ev:  pop  cx
         dec  dx
         jnz  fr_row
 fr_end: pop  di
-        pop  si
-        pop  dx
-        pop  cx
-        pop  bx
-        pop  ax
-        pop  bp
-        ret  10
-
-; roundrect: push x, y, w, h, colour
-; Rounded filled rectangle using the course's disc and fillrect routines.
-; Radius is 2 pixels for normal cars, 1 pixel for very small distant cars.
-roundrect:
-        push bp
-        mov  bp, sp
-        push ax
-        push bx
-        push cx
-        push dx
-        push si
-        push di
-        mov  ax, [bp+12]
-        mov  [rr_x], ax
-        mov  ax, [bp+10]
-        mov  [rr_y], ax
-        mov  ax, [bp+8]
-        mov  [rr_w], ax
-        mov  ax, [bp+6]
-        mov  [rr_h], ax
-        mov  al, [bp+4]
-        mov  [rr_col], al
-        mov  word [rr_r], 1
-        cmp  word [rr_w], 8
-        jb   rr_small
-        cmp  word [rr_h], 6
-        jb   rr_small
-        mov  word [rr_r], 2
-rr_small:
-        ; central vertical strip
-        mov  ax, [rr_x]
-        add  ax, [rr_r]
-        push ax
-        mov  ax, [rr_y]
-        push ax
-        mov  ax, [rr_w]
-        mov  bx, [rr_r]
-        shl  bx, 1
-        sub  ax, bx
-        push ax
-        mov  ax, [rr_h]
-        push ax
-        xor  ax, ax
-        mov  al, [rr_col]
-        push ax
-        call fillrect
-        ; top strip
-        mov  ax, [rr_x]
-        add  ax, [rr_r]
-        push ax
-        mov  ax, [rr_y]
-        push ax
-        mov  ax, [rr_w]
-        mov  bx, [rr_r]
-        shl  bx, 1
-        sub  ax, bx
-        push ax
-        mov  ax, [rr_r]
-        push ax
-        xor  ax, ax
-        mov  al, [rr_col]
-        push ax
-        call fillrect
-        ; bottom strip
-        mov  ax, [rr_x]
-        add  ax, [rr_r]
-        push ax
-        mov  ax, [rr_y]
-        add  ax, [rr_h]
-        sub  ax, [rr_r]
-        push ax
-        mov  ax, [rr_w]
-        mov  bx, [rr_r]
-        shl  bx, 1
-        sub  ax, bx
-        push ax
-        mov  ax, [rr_r]
-        push ax
-        xor  ax, ax
-        mov  al, [rr_col]
-        push ax
-        call fillrect
-        ; four rounded corners
-        mov  si, dtab3
-        mov  cx, [rr_r]
-        mov  bx, [rr_x]
-        add  bx, cx
-        mov  dx, [rr_y]
-        add  dx, cx
-        mov  al, [rr_col]
-        call drawdisc
-        mov  si, dtab3
-        mov  cx, [rr_r]
-        mov  bx, [rr_x]
-        add  bx, [rr_w]
-        sub  bx, cx
-        mov  dx, [rr_y]
-        add  dx, cx
-        mov  al, [rr_col]
-        call drawdisc
-        mov  si, dtab3
-        mov  cx, [rr_r]
-        mov  bx, [rr_x]
-        add  bx, cx
-        mov  dx, [rr_y]
-        add  dx, [rr_h]
-        sub  dx, cx
-        mov  al, [rr_col]
-        call drawdisc
-        mov  si, dtab3
-        mov  cx, [rr_r]
-        mov  bx, [rr_x]
-        add  bx, [rr_w]
-        sub  bx, cx
-        mov  dx, [rr_y]
-        add  dx, [rr_h]
-        sub  dx, cx
-        mov  al, [rr_col]
-        call drawdisc
-        pop  di
         pop  si
         pop  dx
         pop  cx
@@ -1044,7 +1305,39 @@ PERIOD  equ 15680               ; length of the traffic ring (245 m, 1 m = 64 un
 ZLOW    equ 384
 
 quitflag: db 0
-state:    db 0                  ; 0 menu, 1 highway, 2 parking, 3 message
+state:    db 0                  ; 0 menu, 1 highway, 2 parking, 3 message, 4 garage, 5 pause
+cam:      db 0                  ; camera: 0 cockpit, 1 chase, 2 high chase
+camnote:  dw 0
+msel:     db 0                  ; selected line of the main menu
+psel:     db 0                  ; selected line of the pause menu
+gsel:     db 0                  ; car shown in the garage
+gmsg:     dw 0                  ; garage message timer
+earned:   dw 0
+glide:    dw 4                  ; sideways speed of the camera (car handling)
+cam_hi:   dw 1
+cam_lo:   dw 0x5E00
+cam_lwm:  dw 8
+cam_lwa:  dw 7
+cam_cb:   dw 0
+cam_gnd:  dw 167
+cam_jmin: dw 0
+cam_kmin: dw 2
+; the cars you can drive
+car_vmax:  dw 2240,2400,2640,2400,3040
+car_acc:   db 7,7,6,7,6
+car_brk:   dw 24,26,30,26,36
+car_glide: dw 4,4,5,3,6
+car_price: dw 0,2500,6000,10000,16000
+car_pntof: db 0,1,2,3,4
+car_dsgof: db 0,1,2,3,4
+; camera tables: hi, lo (distance constant), lane scale, lane base, camera back, last ground row, first building
+camh_tab: dw 1,0x5E00,8,7,0,167,0
+          dw 2,43228,5,7,800,200,-1
+          dw 4,1856,4,7,2000,200,-2
+camp_tab: dw 0,18560,16,20,0,167,0
+          dw 0,55000,8,15,900,200,0
+          dw 1,39464,6,12,1500,200,0
+
 scene:    db 1                  ; which world is drawn: 1 highway, 2 parking
 spd:      dw 0                  ; speed, 1/16 km/h, negative = reversing
 vmax:     dw 2240
@@ -1081,7 +1374,8 @@ oldpx:    dw 0
 
 car_z:    times NC dw 0
 car_lane: dw 1,0,2,2,1,0,0,1,2,1
-car_col:  dw 9,3,15,4,14,2,3,9,4,15
+car_pnt:  dw 1,5,3,2,4,0,1,3,2,5       ; paint of every traffic car
+car_des:  dw 1,0,3,2,4,1,0,2,3,1       ; body shape of every traffic car
 car_off:  dw 0,2240,2240,4480,6720,6720,8960,11200,11200,13440
 
 ; parking obstacles: x0, x1, z0, z1
@@ -1101,6 +1395,9 @@ game_init:
 menu_reset:
         mov  byte [state], 0
         mov  byte [scene], 1
+        mov  byte [cam], 1
+        call set_cam
+        call apply_car
         mov  word [spd], 1100
         mov  word [odo], 0
         mov  word [camu], 64
@@ -1133,10 +1430,84 @@ game_update:
         je   u_park
         cmp  al, 3
         je   u_end
+        cmp  al, 4
+        je   u_gar
+        cmp  al, 5
+        je   u_pause
         jmp  upd_menu
 u_hwy:  jmp  upd_hwy
 u_park: jmp  upd_park
 u_end:  jmp  upd_end
+u_gar:  jmp  upd_garage
+u_pause: jmp upd_pause
+
+; set_cam: loads the numbers of the chosen camera (cam) for the world shown
+set_cam:
+        push ax
+        push bx
+        push cx
+        push si
+        push di
+        xor  ah, ah
+        mov  al, [cam]
+        mov  bx, 14
+        mul  bx
+        mov  si, camh_tab
+        cmp  byte [scene], 2
+        jne  sc1
+        mov  si, camp_tab
+sc1:    add  si, ax
+        mov  di, cam_hi
+        mov  cx, 7
+sc2:    lodsw
+        mov  [di], ax
+        add  di, 2
+        loop sc2
+        mov  ax, [cam_hi]
+        inc  ax
+        mov  [cam_kmin], ax
+        pop  di
+        pop  si
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; next_cam: C key / pause menu
+next_cam:
+        mov  al, [usercam]
+        inc  al
+        cmp  al, 3
+        jb   nc1
+        xor  al, al
+nc1:    mov  [usercam], al
+        mov  [cam], al
+        call set_cam
+        mov  word [camnote], 150
+        call save_game
+        ret
+
+; apply_car: speed, acceleration, brakes and handling of the chosen car
+apply_car:
+        push ax
+        push bx
+        xor  bh, bh
+        mov  bl, [selcar]
+        mov  ax, bx
+        shl  bx, 1
+        mov  ax, [car_vmax+bx]
+        mov  [vmax], ax
+        mov  ax, [car_brk+bx]
+        mov  [brk], ax
+        mov  ax, [car_glide+bx]
+        mov  [glide], ax
+        mov  bl, [selcar]
+        xor  bh, bh
+        mov  al, [car_acc+bx]
+        mov  [accsh], al
+        pop  bx
+        pop  ax
+        ret
 
 ; ---------------------------------------------------------------- menu
 upd_menu:
@@ -1147,14 +1518,169 @@ upd_menu:
         call traffic_update
         mov  al, [lastkey]
         mov  byte [lastkey], 0
-        cmp  al, 2
-        je   hwy_start
+        cmp  al, 0x48
+        jne  um1
+        mov  al, [msel]
+        dec  al
+        and  al, 3
+        mov  [msel], al
+        ret
+um1:    cmp  al, 0x50
+        jne  um2
+        mov  al, [msel]
+        inc  al
+        and  al, 3
+        mov  [msel], al
+        ret
+um2:    cmp  al, 2
+        je   um_hwy
         cmp  al, 3
-        je   park_start
+        je   um_park
+        cmp  al, 4
+        je   um_gar
         cmp  al, 1
+        je   um_quit
+        cmp  al, 0x1C
         jne  um_x
+        mov  al, [msel]
+        or   al, al
+        jz   um_hwy
+        cmp  al, 1
+        je   um_park
+        cmp  al, 2
+        je   um_gar
+um_quit:
         mov  byte [quitflag], 1
 um_x:   ret
+um_hwy: jmp  hwy_start
+um_park: jmp park_start
+um_gar: mov  byte [state], 4
+        mov  al, [selcar]
+        mov  [gsel], al
+        mov  word [gmsg], 0
+        ret
+
+; ---------------------------------------------------------------- garage
+upd_garage:
+        cmp  word [gmsg], 0
+        je   ug0
+        dec  word [gmsg]
+ug0:    mov  al, [lastkey]
+        mov  byte [lastkey], 0
+        cmp  al, 1
+        jne  ug1
+        mov  byte [state], 0
+        ret
+ug1:    cmp  al, 0x4B
+        jne  ug2
+        mov  al, [gsel]
+        or   al, al
+        jnz  ug1a
+        mov  al, 5
+ug1a:   dec  al
+        mov  [gsel], al
+        ret
+ug2:    cmp  al, 0x4D
+        jne  ug3
+        mov  al, [gsel]
+        inc  al
+        cmp  al, 5
+        jb   ug2a
+        xor  al, al
+ug2a:   mov  [gsel], al
+        ret
+ug3:    cmp  al, 0x1C
+        je   ug4
+        cmp  al, 0x39
+        je   ug4
+        ret
+ug4:    xor  bh, bh
+        mov  bl, [gsel]
+        mov  cl, bl
+        mov  al, 1
+        shl  al, cl
+        test [unl], al
+        jnz  ug6                 ; already owned: just choose it
+        shl  bx, 1
+        mov  dx, [car_price+bx]
+        cmp  [bank], dx
+        jb   ug5
+        sub  [bank], dx          ; pay with points and unlock
+        or   [unl], al
+        jmp  ug6
+ug5:    mov  word [gmsg], 90     ; not enough points
+        ret
+ug6:    mov  al, [gsel]
+        mov  [selcar], al
+        mov  word [gmsg], 0
+        call apply_car
+        call save_game
+        ret
+
+; ------------------------------------------------------------ pause menu
+upd_pause:
+        mov  al, [lastkey]
+        mov  byte [lastkey], 0
+        cmp  al, 1
+        je   pa_resume
+        cmp  al, 0x48
+        jne  pa1
+        mov  al, [psel]
+        or   al, al
+        jnz  pa0
+        mov  al, 5
+pa0:    dec  al
+        mov  [psel], al
+        ret
+pa1:    cmp  al, 0x50
+        jne  pa2
+        mov  al, [psel]
+        inc  al
+        cmp  al, 5
+        jb   pa1a
+        xor  al, al
+pa1a:   mov  [psel], al
+        ret
+pa2:    cmp  al, 0x1C
+        je   pa_go
+        cmp  al, 0x39
+        je   pa_go
+        cmp  al, 0x4B
+        je   pa_side
+        cmp  al, 0x4D
+        je   pa_side
+        ret
+pa_side: mov  al, [psel]
+        cmp  al, 2
+        je   pa_cam
+        cmp  al, 3
+        je   pa_sm
+        ret
+pa_go:  mov  al, [psel]
+        or   al, al
+        jz   pa_resume
+        cmp  al, 1
+        je   pa_restart
+        cmp  al, 2
+        je   pa_cam
+        cmp  al, 3
+        je   pa_sm
+        jmp  menu_reset
+pa_resume:
+        mov  al, [scene]
+        mov  [state], al
+        ret
+pa_restart:
+        cmp  byte [scene], 2
+        je   pa_rp
+        jmp  hwy_start
+pa_rp:  jmp  park_start
+pa_cam: call next_cam
+        ret
+pa_sm:  xor  byte [smooth], 1
+        mov  byte [autooff], 0
+        call save_game
+        ret
 
 ; ------------------------------------------------------- common physics
 ; phys: Up accelerates (fast at first, slower near top speed), Space brakes
@@ -1263,10 +1789,11 @@ tf4:    ret
 hwy_start:
         mov  byte [state], 1
         mov  byte [scene], 1
+        mov  al, [usercam]
+        mov  [cam], al
+        call set_cam
+        call apply_car
         mov  word [spd], 0
-        mov  word [vmax], 2240
-        mov  byte [accsh], 7
-        mov  word [brk], 24
         mov  word [revacc], 3
         mov  word [negrev], -128
         mov  word [odo], 0
@@ -1290,9 +1817,9 @@ hwy_start:
         ret
 
 upd_hwy:
-        cmp  byte [keys+1], 0
+        call level_keys
+        cmp  byte [state], 1
         je   uh0
-        call menu_reset
         ret
 uh0:    call lane_input
         call phys
@@ -1346,7 +1873,32 @@ end_level:
         mov  byte [state], 3
         mov  word [endtimer], 72
         mov  byte [lastkey], 0
+        ; the score of the run is added to your points
+        mov  ax, [score]
+        mov  [earned], ax
+        add  ax, [bank]
+        jnc  el1
+        mov  ax, 0xFFFF
+el1:    mov  [bank], ax
+        call save_game
         ret
+
+; level_keys: ESC opens the pause menu, C changes the camera
+level_keys:
+        mov  al, [lastkey]
+        mov  byte [lastkey], 0
+        cmp  al, 1
+        jne  lk1
+        mov  byte [state], 5
+        mov  byte [psel], 0
+        ret
+lk1:    cmp  al, 0x2E
+        jne  lk2
+        call next_cam
+lk2:    cmp  word [camnote], 0
+        je   lk3
+        dec  word [camnote]
+lk3:    ret
 
 ; Left / Right arrow: one lane per key press; the camera glides to the lane
 lane_input:
@@ -1385,12 +1937,12 @@ li4:    mov  [wheel], dx
         jl   li_r
         jg   li_l
         ret
-li_r:   add  bx, 4
+li_r:   add  bx, [glide]
         cmp  bx, ax
         jle  li5
         mov  bx, ax
         jmp  li5
-li_l:   sub  bx, 4
+li_l:   sub  bx, [glide]
         cmp  bx, ax
         jge  li5
         mov  bx, ax
@@ -1452,6 +2004,9 @@ hc_end: ret
 park_start:
         mov  byte [state], 2
         mov  byte [scene], 2
+        mov  al, [usercam]
+        mov  [cam], al
+        call set_cam
         mov  word [spd], 0
         mov  word [vmax], 176
         mov  byte [accsh], 5
@@ -1474,9 +2029,9 @@ park_start:
         ret
 
 upd_park:
-        cmp  byte [keys+1], 0
+        call level_keys
+        cmp  byte [state], 2
         je   up0
-        call menu_reset
         ret
 up0:    call phys
         call calc_adv
@@ -1726,15 +2281,10 @@ b_ww: dw 0
 b_wy: dw 0
 b_f:  dw 0
 b_c:  dw 0
-dc_cx: dw 0
-dc_yb: dw 0
-dc_lw: dw 0
-dc_col: dw 0
 c_W:  dw 0
 c_H:  dw 0
 c_sh: dw 0
 c_bh: dw 0
-c_ch: dw 0
 c_x0: dw 0
 c_ytb: dw 0
 c_xc: dw 0
@@ -1743,12 +2293,13 @@ c_yc: dw 0
 c_t:  dw 0
 tdone: times NC dw 0
 t_cnt: dw 0
+pdrawn: dw 0
 pp_x: dw 0
 pp_z: dw 0
 sc_t: dw 0
 
 bld_ht:  db 7,10,8,12,9,6,11,8
-bld_col: db 7,6,3,7,8,6,7,3
+bld_col: db 5,0,1,5,3,4,5,1
 sky_h:   db 10,16,8,20,12,9,18,11,15,7,19,13,9,17,10,14
 
 ; 1-bit pictures: width, height, one word per row (bit 15 = leftmost)
@@ -1783,26 +2334,40 @@ s_m:     db " M",0
 s_dot:   db ".",0
 s_ban:   db "PARKING * LEVEL 2",0
 s_crash: db "CRASH  -50",0
+s_camt:  db "CAMERA  ",0
+s_cam0:  db "COCKPIT",0
+s_cam1:  db "CHASE",0
+s_cam2:  db "HIGH CHASE",0
+cam_names: dw s_cam0,s_cam1,s_cam2
 s_touch: db "TOUCH  -50",0
 
+
 game_render:
-        cmp  byte [scene], 2
+        cmp  byte [state], 4
+        jne  gr0
+        jmp  render_garage
+gr0:    cmp  byte [scene], 2
         je   gr_p
         call render_highway
         jmp  gr_c
 gr_p:   call render_parking
-gr_c:   call draw_cockpit
-        call draw_hud
-        mov  al, [state]
-        cmp  al, 0
+gr_c:   cmp  byte [state], 0
         je   gr_menu
+        cmp  byte [cam], 0
+        jne  gr_ch
+        call draw_cockpit
+        jmp  gr_h
+gr_ch:  call draw_chase_hud
+gr_h:   call draw_hud
+        mov  al, [state]
         cmp  al, 3
         je   gr_end
-        ; crash message
+        cmp  al, 5
+        je   gr_pause
         cmp  word [crash], 0
-        je   gr_x
+        je   gr_cn
         test byte [crash], 8
-        jz   gr_x
+        jz   gr_cn
         mov  si, s_crash
         cmp  byte [scene], 2
         jne  gr_c2
@@ -1812,32 +2377,32 @@ gr_c2:  mov  bx, 100
         mov  al, 12
         mov  ah, 2
         call puts_sh
+gr_cn:  cmp  word [camnote], 0
+        je   gr_x
+        mov  si, s_camt
+        mov  bx, 112
+        mov  dx, 32
+        mov  al, 7
+        mov  ah, 1
+        call puts_sh
+        xor  bh, bh
+        mov  bl, [cam]
+        shl  bx, 1
+        mov  si, [cam_names+bx]
+        mov  bx, [t_x]
+        mov  dx, 32
+        mov  al, 14
+        mov  ah, 1
+        call puts_sh
 gr_x:   ret
 gr_menu: call draw_menu
         ret
 gr_end: call draw_endpanel
         ret
-
-; ------------------------------------------------------------ sky
-; skyband: bx = first row, cx = last row + 1, al/ah = the two colours
-skyband:
-        push bx
-        push cx
-        push dx
-        push si
-        mov  si, cx
-sb1:    xor  cx, cx
-        mov  dx, 320
-        call spandith
-        inc  bx
-        cmp  bx, si
-        jb   sb1
-        pop  si
-        pop  dx
-        pop  cx
-        pop  bx
+gr_pause: call draw_pause
         ret
 
+; ------------------------------------------------------------ sky
 ; skyrows: smooth sky gradient for the rows 0 .. cx-1
 skyrows:
         push ax
@@ -1848,10 +2413,8 @@ skyrows:
         mov  si, cx
         xor  bx, bx
 sr1:    mov  ax, bx
-        shl  ax, 1
-        add  ax, bx
         shr  ax, 1
-        shr  ax, 1               ; y * 3 / 4
+        shr  ax, 1               ; 4 rows share one colour of the gradient
         add  ax, 16
         xor  cx, cx
         mov  dx, 320
@@ -1866,32 +2429,75 @@ sr1:    mov  ax, bx
         pop  ax
         ret
 
+; a soft round cloud: bx = x, dx = y
+cloud:  push ax
+        push bx
+        push cx
+        push dx
+        push si
+        mov  [c_xc], bx
+        mov  [c_yc], dx
+        ; shaded underside
+        mov  si, dtab8
+        mov  cx, 8
+        mov  bx, [c_xc]
+        add  bx, 10
+        mov  dx, [c_yc]
+        add  dx, 4
+        mov  al, 11
+        call drawdisc
+        ; white puffs
+        mov  si, dtab8
+        mov  cx, 8
+        mov  bx, [c_xc]
+        mov  dx, [c_yc]
+        mov  al, 15
+        call drawdisc
+        mov  si, dtab10
+        mov  cx, 10
+        mov  bx, [c_xc]
+        add  bx, 11
+        mov  dx, [c_yc]
+        sub  dx, 3
+        call drawdisc
+        mov  si, dtab8
+        mov  cx, 8
+        mov  bx, [c_xc]
+        add  bx, 22
+        mov  dx, [c_yc]
+        call drawdisc
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
 draw_sky_hwy:
         mov  cx, 88
         call skyrows
-        ; clouds
-        RECT 56,24,26,4,15
-        RECT 46,28,50,5,15
-        RECT 52,33,36,2,11
-        RECT 214,38,22,4,15
-        RECT 204,42,44,4,15
+        mov  bx, 40
+        mov  dx, 30
+        call cloud
+        mov  bx, 205
+        mov  dx, 40
+        call cloud
         ; far away skyline
         xor  si, si
 sk1:    xor  ax, ax
         mov  al, [sky_h+si]
         mov  [c_t], ax
         mov  ax, si
-        mov  cl, 4
         mov  bx, 20
         mul  bx
         mov  [c_xc], ax
         mov  ax, 88
         sub  ax, [c_t]
         mov  [c_yc], ax
-        mov  bx, 244
+        mov  bx, 202
         test si, 2
         jz   sk2
-        mov  bx, 246
+        mov  bx, 203
 sk2:    mov  [c_wc], bx
         RECT [c_xc],[c_yc],20,[c_t],[c_wc]
         inc  si
@@ -1905,15 +2511,19 @@ draw_ground_hwy:
 gh_row: mov  ax, [g_y]
         sub  ax, 87
         mov  [g_k], ax
-        add  ax, 7
-        mov  [g_lw], ax
+        mul  word [cam_lwm]
+        mov  cl, 3
+        shr  ax, cl
+        add  ax, [cam_lwa]
+        mov  [g_lw], ax          ; width of a lane on this row
         mov  bx, [g_k]
-        cmp  bx, 2
+        cmp  bx, [cam_kmin]
         jae  gh1
-        mov  bx, 2
-gh1:    mov  dx, 1
-        mov  ax, 0x5E00          ; 89600 = 1400 m * 64
-        div  bx
+        mov  bx, [cam_kmin]
+gh1:    mov  dx, [cam_hi]
+        mov  ax, [cam_lo]
+        div  bx                  ; distance of this row
+        sub  ax, [cam_cb]
         add  ax, [odo]
         mov  [g_zw], ax
         mov  ax, [camu]
@@ -1941,47 +2551,49 @@ gh1:    mov  dx, 1
         add  ax, [g_hw]
         mov  [g_xr], ax
         mov  bx, [g_y]
+        ; pavement on both sides
         mov  ax, [g_k]
-        shr  ax, 1
-        cmp  ax, 31
+        mov  cl, 3
+        shr  ax, cl
+        cmp  ax, 15
         jbe  gh2a
-        mov  ax, 31
-gh2a:   mov  [g_kk], ax
-        ; pavement on both sides (colour gets brighter towards the car)
-        add  ax, 148
+        mov  ax, 15
+gh2a:   add  ax, 86
         test word [g_zw], 512
         jz   gh2
-        add  ax, 32
-gh2:    mov  ah, al
-        xor  cx, cx
+        add  ax, 16
+gh2:    xor  cx, cx
         mov  dx, [g_xl]
-        call spandith
+        call span
         mov  cx, [g_xr]
         mov  dx, 320
-        call spandith
-        ; asphalt
-        mov  ax, [g_kk]
-        add  ax, 84
+        call span
+        ; asphalt: lighter far away, darker near
+        mov  ax, [g_k]
+        shr  ax, 1
+        shr  ax, 1
+        cmp  ax, 23
+        jbe  gh3a
+        mov  ax, 23
+gh3a:   add  ax, 38
         test word [g_zw], 512
         jz   gh3
-        add  ax, 32
-gh3:    mov  ah, al
-        mov  cx, [g_xl]
+        add  ax, 24
+gh3:    mov  cx, [g_xl]
         add  cx, [g_ew]
         mov  dx, [g_xr]
         sub  dx, [g_ew]
-        call spandith
+        call span
         ; white edge lines
         mov  al, 15
-        mov  ah, 15
         mov  cx, [g_xl]
         mov  dx, cx
         add  dx, [g_ew]
-        call spandith
+        call span
         mov  dx, [g_xr]
         mov  cx, dx
         sub  cx, [g_ew]
-        call spandith
+        call span
         ; dashed lane lines
         mov  ax, [g_zw]
         and  ax, 1023
@@ -1994,7 +2606,7 @@ gh3:    mov  ah, al
         mov  [g_dw], ax
         mov  si, [g_lw]
         shr  si, 1
-        mov  ax, 0x0F0F
+        mov  al, 15
         mov  cx, [g_cx]
         sub  cx, si
         mov  dx, [g_dw]
@@ -2002,7 +2614,7 @@ gh3:    mov  ah, al
         sub  cx, dx
         mov  dx, cx
         add  dx, [g_dw]
-        call spandith
+        call span
         mov  cx, [g_cx]
         add  cx, si
         mov  dx, [g_dw]
@@ -2010,22 +2622,27 @@ gh3:    mov  ah, al
         sub  cx, dx
         mov  dx, cx
         add  dx, [g_dw]
-        call spandith
+        call span
 gh_nd:  inc  word [g_y]
-        cmp  word [g_y], 167
+        mov  ax, [cam_gnd]
+        cmp  [g_y], ax
         jae  gh_dn
         jmp  gh_row
 gh_dn:  ret
 
 ; ------------------------------------------------------- buildings
-; b_project: ax = distance z (>= 448); sets b_k, b_lw, b_yb, b_cx
+; b_project: ax = distance z (camera space, >= 448);
+;            sets b_k, b_lw, b_yb, b_cx
 b_project:
         mov  bx, ax
-        mov  dx, 1
-        mov  ax, 0x5E00
+        mov  dx, [cam_hi]
+        mov  ax, [cam_lo]
         div  bx
         mov  [b_k], ax
-        add  ax, 7
+        mul  word [cam_lwm]
+        mov  cl, 3
+        shr  ax, cl
+        add  ax, [cam_lwa]
         mov  [b_lw], ax
         mov  bx, ax
         mov  ax, [b_k]
@@ -2055,9 +2672,10 @@ bl_lp:  mov  ax, [b_j]
         mov  cl, 10
         shl  ax, cl
         sub  ax, [b_off]
-        mov  [b_z], ax
+        add  ax, [cam_cb]
         cmp  ax, 448
-        jb   bl_nx
+        jl   bl_nx
+        mov  [b_z], ax
         call b_project
         mov  ax, [b_base]
         add  ax, [b_j]
@@ -2073,8 +2691,11 @@ bl_lp:  mov  ax, [b_j]
         mov  word [b_side], 1
         call draw_bld
 bl_nx:  dec  word [b_j]
-        jns  bl_lp
-        ret
+        mov  ax, [b_j]
+        cmp  ax, [cam_jmin]
+        jl   bl_dn
+        jmp  bl_lp
+bl_dn:  ret
 
 draw_bld:
         mov  ax, [b_lw]
@@ -2104,11 +2725,42 @@ db2:    mov  [b_x0], bx
         mov  [b_h], ax
         xor  ax, ax
         mov  al, [bld_col+si]
+        mov  bx, ax
+        shl  ax, 1
+        add  ax, bx
+        shl  ax, 1
+        shl  ax, 1
+        add  ax, 118             ; paint ramp of this building
         mov  [c_t], ax
         mov  ax, [b_yb]
         sub  ax, [b_h]
         mov  [c_yc], ax
-        RECT [b_x0],[c_yc],[b_bw],[b_h],[c_t]
+        mov  ax, [c_t]
+        add  ax, 5
+        mov  [c_wc], ax
+        RECT [b_x0],[c_yc],[b_bw],[b_h],[c_wc]
+        ; lit and shaded sides, roof edge: the building looks round
+        mov  ax, [b_bw]
+        mov  cl, 4
+        shr  ax, cl
+        inc  ax
+        mov  [c_H], ax
+        mov  ax, [c_t]
+        add  ax, 8
+        mov  [c_wc], ax
+        RECT [b_x0],[c_yc],[c_H],[b_h],[c_wc]
+        mov  ax, [b_x0]
+        add  ax, [b_bw]
+        sub  ax, [c_H]
+        mov  [c_xc], ax
+        mov  ax, [c_t]
+        add  ax, 2
+        mov  [c_wc], ax
+        RECT [c_xc],[c_yc],[c_H],[b_h],[c_wc]
+        mov  ax, [c_t]
+        add  ax, 10
+        mov  [c_wc], ax
+        RECT [b_x0],[c_yc],[b_bw],[c_H],[c_wc]
         ; shop front
         mov  ax, [b_lw]
         shr  ax, 1
@@ -2117,7 +2769,7 @@ db2:    mov  [b_x0], bx
         mov  ax, [b_yb]
         sub  ax, [b_ph]
         mov  [c_yc], ax
-        RECT [b_x0],[c_yc],[b_bw],[b_ph],8
+        RECT [b_x0],[c_yc],[b_bw],[b_ph],211
         cmp  word [b_lw], 12
         jb   db_end
         ; windows: 3 columns, one row per floor
@@ -2129,7 +2781,7 @@ db2:    mov  [b_x0], bx
         add  ax, bx
         mov  cl, 3
         shr  ax, cl
-        mov  [b_wh], ax          ; window height = 3/8 of a floor... 
+        mov  [b_wh], ax
         mov  ax, [b_bw]
         mov  bl, 3
         div  bl
@@ -2170,7 +2822,7 @@ db_cl:  mov  ax, [b_c]
         add  ax, bx
         add  ax, [b_idx]
         and  ax, 3
-        mov  word [c_t], 1
+        mov  word [c_t], 195
         jnz  db_w
         mov  word [c_t], 14
 db_w:   RECT [c_xc],[b_wy],[b_ww],[b_wh],[c_t]
@@ -2184,176 +2836,44 @@ db_w:   RECT [c_xc],[b_wy],[b_ww],[b_wh],[c_t]
         jmp  db_fl
 db_end: ret
 
-; -------------------------------------------------------------- cars
-; drawcar: dc_cx = centre, dc_yb = bottom row, dc_lw = lane width, dc_col
-drawcar:
-        mov  ax, [dc_lw]
-        mov  bx, ax
-        shl  ax, 1
-        shl  ax, 1
-        shl  ax, 1
-        sub  ax, bx
-        mov  cl, 3
-        shr  ax, cl              ; W = 7/8 lane
-        cmp  ax, 3
-        jae  dcw
-        mov  ax, 3
-dcw:    mov  [c_W], ax
-        mov  bx, ax
-        shl  ax, 1
-        shl  ax, 1
-        add  ax, bx
-        mov  cl, 3
-        shr  ax, cl              ; H = 5/8 W
-        cmp  ax, 2
-        jae  dch
-        mov  ax, 2
-dch:    mov  [c_H], ax
-        mov  cl, 3
-        shr  ax, cl
-        cmp  ax, 1
-        jae  dcs
-        mov  ax, 1
-dcs:    mov  [c_sh], ax
-        mov  ax, [c_H]
-        mov  bx, ax
-        shl  ax, 1
-        add  ax, bx
-        shr  ax, 1
-        shr  ax, 1
-        cmp  ax, 1
-        jae  dcb
-        mov  ax, 1
-dcb:    mov  [c_bh], ax
-        mov  ax, [c_H]
-        sub  ax, [c_bh]
-        cmp  ax, 1
-        jge  dcc
-        mov  ax, 1
-dcc:    mov  [c_ch], ax
-        mov  ax, [c_W]
-        shr  ax, 1
-        mov  bx, [dc_cx]
-        sub  bx, ax
-        mov  [c_x0], bx
-        mov  ax, [dc_yb]
-        sub  ax, [c_sh]
-        sub  ax, [c_bh]
-        mov  [c_ytb], ax
-        sub  ax, [c_ch]
-        mov  [c_yc], ax
-        mov  ax, [c_W]
-        shr  ax, 1
-        shr  ax, 1
-        shr  ax, 1
-        mov  bx, [c_x0]
-        add  bx, ax
-        mov  [c_xc], bx
-        mov  bx, [c_W]
-        shr  bx, 1
-        shr  bx, 1
-        mov  cx, [c_W]
-        sub  cx, bx
-        mov  [c_wc], cx
-        ; ground shadow / bumper
-        mov  ax, [dc_yb]
-        sub  ax, [c_sh]
-        mov  [c_t], ax
-        RECT [c_x0],[c_t],[c_W],[c_sh],0
-        ; lower body and cabin use rounded silhouettes for softer car edges
-        PUSHV [c_x0]
-        PUSHV [c_ytb]
-        PUSHV [c_W]
-        PUSHV [c_bh]
-        PUSHV [dc_col]
-        call roundrect
-        PUSHV [c_xc]
-        PUSHV [c_yc]
-        PUSHV [c_wc]
-        PUSHV [c_ch]
-        PUSHV [dc_col]
-        call roundrect
-        ; rear window
-        cmp  word [c_ch], 3
-        jb   dc_tl
-        mov  ax, [c_wc]
-        shr  ax, 1
-        shr  ax, 1
-        shr  ax, 1
-        inc  ax
-        mov  bx, [c_xc]
-        add  bx, ax
-        mov  [c_t], bx
-        shl  ax, 1
-        mov  cx, [c_wc]
-        sub  cx, ax
-        mov  ax, [c_yc]
-        inc  ax
-        mov  dx, [c_ch]
-        dec  dx
-        mov  [sc_t], ax
-        mov  [dc_lw], dx
-        mov  [c_wc], cx
-        RECT [c_t],[sc_t],[c_wc],[dc_lw],1
-dc_tl:  ; tail lights
-        mov  ax, [c_W]
-        mov  cl, 3
-        shr  ax, cl
-        cmp  ax, 1
-        jae  dtl1
-        mov  ax, 1
-dtl1:   mov  [c_xc], ax          ; light width
-        mov  ax, [c_bh]
-        shr  ax, 1
-        cmp  ax, 1
-        jae  dtl2
-        mov  ax, 1
-dtl2:   mov  [c_wc], ax          ; light height
-        mov  ax, [c_bh]
-        shr  ax, 1
-        shr  ax, 1
-        add  ax, [c_ytb]
-        mov  [c_t], ax
-        mov  ax, [c_W]
-        mov  cl, 4
-        shr  ax, cl
-        add  ax, [c_x0]
-        mov  [sc_t], ax
-        RECT [sc_t],[c_t],[c_xc],[c_wc],12
-        mov  ax, [c_x0]
-        add  ax, [c_W]
-        sub  ax, [c_xc]
-        mov  bx, [c_W]
-        mov  cl, 4
-        shr  bx, cl
-        sub  ax, bx
-        mov  [sc_t], ax
-        RECT [sc_t],[c_t],[c_xc],[c_wc],12
-        ; number plate
-        cmp  word [c_W], 22
-        jb   dc_end
-        mov  ax, [c_W]
-        shr  ax, 1
-        shr  ax, 1
-        mov  [c_xc], ax
-        shr  ax, 1
-        mov  bx, [dc_cx]
-        sub  bx, ax
-        mov  [sc_t], bx
-        mov  ax, [c_bh]
-        shr  ax, 1
-        add  ax, [c_ytb]
-        mov  [c_t], ax
-        mov  ax, [c_bh]
-        shr  ax, 1
-        shr  ax, 1
-        inc  ax
-        mov  [c_wc], ax
-        RECT [sc_t],[c_t],[c_xc],[c_wc],15
-dc_end: ret
+; ------------------------------------------------------ player's car
+; (seen from behind in the chase camera)
+draw_player:
+        mov  ax, [cam_cb]
+        add  ax, 1300
+        call b_project
+        mov  ax, [b_yb]
+        mov  [dc_yb], ax
+        mov  ax, [b_lw]
+        mov  [dc_lw], ax
+        mov  ax, [wheel]
+        mov  bx, 3
+        imul bx
+        add  ax, 160
+        mov  [dc_cx], ax
+        call player_look
+        ret
+
+; player_look: shape, paint and brake lights of the car you drive
+player_look:
+        xor  bh, bh
+        mov  bl, [selcar]
+        mov  al, [car_dsgof+bx]
+        xor  ah, ah
+        mov  [dc_des], ax
+        mov  al, [car_pntof+bx]
+        xor  ah, ah
+        mov  [dc_pnt], ax
+        mov  word [dc_brk], 0
+        cmp  byte [keys+0x39], 0
+        je   pl1
+        mov  word [dc_brk], 1
+pl1:    call drawcar
+        ret
 
 ; traffic, drawn from the far one to the near one
 draw_traffic:
+        mov  word [pdrawn], 0
         xor  si, si
 dt0:    mov  word [tdone+si], 0
         add  si, 2
@@ -2378,7 +2898,22 @@ dt2:    add  si, 2
         jl   dt_end
         mov  word [tdone+bx], 1
         mov  si, bx
-        cmp  dx, 448
+        add  dx, [cam_cb]        ; distance seen from the camera
+        cmp  byte [cam], 0
+        je   dt_c
+        cmp  word [pdrawn], 0
+        jne  dt_c
+        mov  ax, [cam_cb]
+        add  ax, 1300
+        cmp  dx, ax
+        jge  dt_c
+        push si
+        push dx
+        call draw_player         ; this car is nearer than yours: yours first
+        pop  dx
+        pop  si
+        mov  word [pdrawn], 1
+dt_c:   cmp  dx, 448
         jl   dt_nx
         cmp  dx, 30000
         jg   dt_nx
@@ -2390,8 +2925,11 @@ dt2:    add  si, 2
         mov  [dc_yb], ax
         mov  ax, [b_lw]
         mov  [dc_lw], ax
-        mov  ax, [car_col+si]
-        mov  [dc_col], ax
+        mov  ax, [car_pnt+si]
+        mov  [dc_pnt], ax
+        mov  ax, [car_des+si]
+        mov  [dc_des], ax
+        mov  word [dc_brk], 0
         mov  ax, [b_cx]
         mov  bx, [car_lane+si]
         cmp  bx, 1
@@ -2404,7 +2942,12 @@ dt3:    mov  [dc_cx], ax
         call drawcar
 dt_nx:  dec  word [t_cnt]
         jnz  dt_pick
-dt_end: ret
+dt_end: cmp  byte [cam], 0
+        je   dt_x
+        cmp  word [pdrawn], 0
+        jne  dt_x
+        call draw_player
+dt_x:   ret
 
 render_highway:
         call draw_sky_hwy
@@ -2414,43 +2957,702 @@ render_highway:
         ret
 
 ; =====================================================================
+;                         CAR  PAINTER  (rear view)
+;  every car is drawn row by row: a rounded roof, glass with a gradient,
+;  a shaded body, tail lights, bumper, tyres - all in smooth colour ramps
+; =====================================================================
+dc_cx:  dw 0
+dc_yb:  dw 0
+dc_lw:  dw 0
+dc_des: dw 0
+dc_pnt: dw 0
+dc_brk: dw 0
+cW:     dw 0
+cHt:     dw 0
+cCab:   dw 0
+cCth:   dw 0
+cCbh:   dw 0
+cW2:    dw 0
+cWh:    dw 0
+cUnder: dw 0
+cRc:    dw 0
+cEw:    dw 0
+cPb:    dw 0
+cTop:   dw 0
+cBodyH: dw 0
+cR:     dw 0
+cRb:    dw 0
+cY:     dw 0
+cHw:    dw 0
+cCol:   dw 0
+cG0:    dw 0
+cG1:    dw 0
+cGl:    dw 0
+cGm:    dw 0
+cT0:    dw 0
+cT1:    dw 0
+cLw:    dw 0
+cSpoil: dw 0
+cTmp:   dw 0
+; per design: height/width (x16), cabin rows (x16), cabin bottom width,
+;             cabin top width (x32 of the car width), spoiler
+dsg_tab: db 10,7,26,22,0        ; city hatch
+         db 9,6,24,18,0         ; sedan
+         db 8,5,25,15,0         ; coupe
+         db 12,8,28,25,0        ; suv
+         db 7,4,24,13,1         ; super gt
+
+; dc_hspan: one row of the car (row cY, half width cHw, colour cCol) with
+; darker edges so the body looks round
+dc_hspan:
+        mov  bx, [cY]
+        mov  cx, [dc_cx]
+        sub  cx, [cHw]
+        mov  dx, [dc_cx]
+        add  dx, [cHw]
+        inc  dx
+        mov  ax, [cCol]
+        call span
+        mov  ax, [cCol]
+        sub  ax, 3
+        mov  bx, [cY]
+        mov  cx, [dc_cx]
+        sub  cx, [cHw]
+        mov  dx, cx
+        add  dx, [cEw]
+        call span
+        mov  cx, [dc_cx]
+        add  cx, [cHw]
+        inc  cx
+        mov  dx, cx
+        sub  cx, [cEw]
+        call span
+        ret
+
+; dc_plain: row cY, half width cHw, one colour (cCol)
+dc_plain:
+        mov  bx, [cY]
+        mov  cx, [dc_cx]
+        sub  cx, [cHw]
+        mov  dx, [dc_cx]
+        add  dx, [cHw]
+        inc  dx
+        mov  ax, [cCol]
+        call span
+        ret
+
+; dc_box: row cY, from x = cx to dx (exclusive), colour cCol
+dc_box: mov  bx, [cY]
+        mov  ax, [cCol]
+        call span
+        ret
+
+drawcar:
+        mov  ax, [dc_lw]
+        mov  bx, ax
+        shl  ax, 1
+        shl  ax, 1
+        shl  ax, 1
+        sub  ax, bx
+        mov  cl, 3
+        shr  ax, cl              ; W = 7/8 of the lane
+        cmp  ax, 3
+        jae  dcw1
+        mov  ax, 3
+dcw1:   mov  [cW], ax
+        cmp  ax, 14
+        jae  dc_big
+        jmp  drawcar_small
+dc_big: mov  bx, [dc_des]
+        mov  ax, bx
+        shl  ax, 1
+        shl  ax, 1
+        add  ax, bx
+        add  ax, dsg_tab
+        mov  si, ax
+        lodsb
+        xor  ah, ah
+        mul  word [cW]
+        mov  cl, 4
+        shr  ax, cl
+        mov  [cHt], ax
+        lodsb
+        xor  ah, ah
+        mul  word [cHt]
+        mov  cl, 4
+        shr  ax, cl
+        cmp  ax, 4
+        jae  dc1
+        mov  ax, 4
+dc1:    mov  [cCab], ax
+        lodsb
+        xor  ah, ah
+        mul  word [cW]
+        mov  cl, 6
+        shr  ax, cl
+        mov  [cCbh], ax
+        lodsb
+        xor  ah, ah
+        mul  word [cW]
+        mov  cl, 6
+        shr  ax, cl
+        mov  [cCth], ax
+        lodsb
+        xor  ah, ah
+        mov  [cSpoil], ax
+        mov  ax, [cW]
+        shr  ax, 1
+        mov  [cW2], ax
+        mov  ax, [cHt]
+        mov  bx, ax
+        shl  ax, 1
+        add  ax, bx
+        mov  cl, 4
+        shr  ax, cl
+        cmp  ax, 2
+        jae  dc2
+        mov  ax, 2
+dc2:    mov  [cWh], ax
+        shr  ax, 1
+        cmp  ax, 1
+        jae  dc3
+        mov  ax, 1
+dc3:    mov  [cUnder], ax
+        mov  ax, [cW]
+        mov  cl, 3
+        shr  ax, cl
+        cmp  ax, 2
+        jae  dc4
+        mov  ax, 2
+dc4:    mov  [cRc], ax
+        mov  ax, [cW]
+        mov  cl, 5
+        shr  ax, cl
+        inc  ax
+        mov  [cEw], ax
+        mov  ax, [dc_pnt]
+        mov  bx, ax
+        shl  ax, 1
+        add  ax, bx
+        shl  ax, 1
+        shl  ax, 1
+        add  ax, 118
+        mov  [cPb], ax
+        mov  ax, [dc_yb]
+        sub  ax, [cHt]
+        inc  ax
+        mov  [cTop], ax
+        mov  ax, [cHt]
+        sub  ax, [cCab]
+        sub  ax, [cUnder]
+        cmp  ax, 3
+        jge  dc5
+        mov  ax, 3
+dc5:    mov  [cBodyH], ax
+        ; glass rows
+        mov  ax, [cCab]
+        shr  ax, 1
+        shr  ax, 1
+        mov  [cG0], ax
+        mov  ax, [cCab]
+        mov  bx, ax
+        shr  bx, 1
+        shr  bx, 1
+        shr  bx, 1
+        sub  ax, bx
+        dec  ax
+        mov  [cG1], ax
+        sub  ax, [cG0]
+        cmp  ax, 1
+        jge  dc6
+        mov  ax, 1
+dc6:    mov  [cGl], ax
+        mov  ax, [cW]
+        mov  cl, 4
+        shr  ax, cl
+        inc  ax
+        mov  [cGm], ax
+        ; soft shadow on the road
+        mov  ax, [cW2]
+        mov  bx, [cW]
+        shr  bx, 1
+        shr  bx, 1
+        add  ax, bx
+        mov  [cTmp], ax
+        mov  word [cCol], 222
+        mov  word [cR], 0
+dc_sh:  mov  bx, [dc_yb]
+        inc  bx
+        add  bx, [cR]
+        mov  cx, [dc_cx]
+        sub  cx, [cTmp]
+        mov  dx, [dc_cx]
+        add  dx, [cTmp]
+        mov  ax, [cCol]
+        call span
+        sub  word [cTmp], 2
+        inc  word [cCol]
+        inc  word [cR]
+        cmp  word [cR], 3
+        jb   dc_sh
+        ; ------------------------------------------------ the rows
+        mov  word [cR], 0
+dcr:    mov  ax, [cTop]
+        add  ax, [cR]
+        mov  [cY], ax
+        mov  ax, [cR]
+        cmp  ax, [cCab]
+        jb   dcr_cab
+        jmp  dcr_body
+; ---- cabin (roof and rear window)
+dcr_cab:
+        mov  ax, [cCbh]
+        sub  ax, [cCth]
+        mul  word [cR]
+        div  word [cCab]
+        add  ax, [cCth]
+        cmp  word [cR], 3
+        jae  dcc1
+        mov  bx, 3
+        sub  bx, [cR]
+        push ax
+        mov  ax, [cW]
+        mov  cl, 5
+        shr  ax, cl
+        inc  ax
+        mul  bx
+        mov  bx, ax
+        pop  ax
+        sub  ax, bx
+dcc1:   cmp  ax, 1
+        jge  dcc2
+        mov  ax, 1
+dcc2:   mov  [cHw], ax
+        mov  ax, [cR]
+        mov  bx, 3
+        mul  bx
+        div  word [cCab]
+        mov  bx, 10
+        sub  bx, ax
+        add  bx, [cPb]
+        mov  [cCol], bx
+        call dc_hspan
+        mov  ax, [cR]
+        cmp  ax, [cG0]
+        jb   dcc9
+        cmp  ax, [cG1]
+        jae  dcc9
+        sub  ax, [cG0]
+        mov  bx, 9
+        mul  bx
+        div  word [cGl]
+        mov  bx, 199
+        sub  bx, ax
+        mov  [cCol], bx
+        mov  ax, [cHw]
+        sub  ax, [cGm]
+        jle  dcc9
+        mov  [cHw], ax
+        call dc_plain
+dcc9:   jmp  dcr_next
+; ---- body, lights, plate, bumper
+dcr_body:
+        sub  ax, [cCab]
+        mov  [cRb], ax
+        cmp  ax, [cBodyH]
+        jb   dcb1
+        jmp  dcr_under
+dcb1:   mov  ax, [cW2]
+        mov  bx, [cRc]
+        shr  bx, 1
+        inc  bx                  ; small radius of the shoulder
+        mov  cx, [cRb]
+        cmp  cx, bx
+        jae  dcb2
+        mov  dx, bx
+        sub  dx, cx
+        push ax
+        mov  ax, dx
+        mul  dx
+        div  bx
+        mov  dx, ax
+        pop  ax
+        sub  ax, dx
+dcb2:   mov  cx, [cBodyH]
+        sub  cx, [cRb]           ; rows left down to the bottom
+        cmp  cx, [cRc]
+        ja   dcb3
+        mov  dx, [cRc]
+        sub  dx, cx
+        push ax
+        mov  ax, dx
+        mul  dx
+        div  word [cRc]
+        mov  dx, ax
+        pop  ax
+        sub  ax, dx
+dcb3:   mov  [cHw], ax
+        mov  ax, [cRb]
+        mov  bx, 5
+        mul  bx
+        div  word [cBodyH]
+        mov  bx, 8
+        sub  bx, ax
+        cmp  word [cRb], 0
+        jne  dcb4
+        mov  bx, 11
+dcb4:   mov  ax, [cBodyH]
+        mov  cx, ax
+        shr  cx, 1
+        shr  cx, 1
+        sub  ax, cx              ; start of the bumper
+        cmp  [cRb], ax
+        jb   dcb5
+        sub  bx, 2
+dcb5:   add  bx, [cPb]
+        mov  [cCol], bx
+        call dc_hspan
+        ; chrome line on top of the bumper
+        mov  ax, [cBodyH]
+        mov  cx, ax
+        shr  cx, 1
+        shr  cx, 1
+        sub  ax, cx
+        cmp  [cRb], ax
+        jne  dcb6
+        mov  ax, [cHw]
+        sub  ax, [cRc]
+        jle  dcb6
+        mov  [cHw], ax
+        mov  word [cCol], 254
+        call dc_plain
+dcb6:   ; tail lights
+        mov  ax, [cBodyH]
+        xor  dx, dx
+        mov  bx, 6
+        div  bx
+        inc  ax
+        mov  [cT0], ax
+        mov  ax, [cBodyH]
+        shl  ax, 1
+        xor  dx, dx
+        mov  bx, 5
+        div  bx
+        cmp  ax, 2
+        jae  dcb7
+        mov  ax, 2
+dcb7:   add  ax, [cT0]
+        mov  [cT1], ax
+        mov  ax, [cRb]
+        cmp  ax, [cT0]
+        jb   dcb_pl
+        cmp  ax, [cT1]
+        jae  dcb_pl
+        mov  ax, [cW]
+        mov  cl, 2
+        shr  ax, cl
+        mov  [cLw], ax
+        mov  ax, [cW]
+        mov  cl, 4
+        shr  ax, cl
+        inc  ax                  ; margin from the edge of the car
+        mov  [cTmp], ax
+        ; left light
+        mov  cx, [dc_cx]
+        sub  cx, [cW2]
+        add  cx, [cTmp]
+        mov  dx, cx
+        add  dx, [cLw]
+        mov  word [cCol], 12
+        call dc_box
+        ; right light
+        mov  dx, [dc_cx]
+        add  dx, [cW2]
+        sub  dx, [cTmp]
+        mov  cx, dx
+        sub  cx, [cLw]
+        call dc_box
+        cmp  word [dc_brk], 0
+        je   dcb_pl
+        ; brake lights glow
+        mov  cx, [dc_cx]
+        sub  cx, [cW2]
+        add  cx, [cTmp]
+        inc  cx
+        mov  dx, cx
+        add  dx, [cLw]
+        sub  dx, 2
+        mov  word [cCol], 14
+        call dc_box
+        mov  dx, [dc_cx]
+        add  dx, [cW2]
+        sub  dx, [cTmp]
+        dec  dx
+        mov  cx, dx
+        sub  cx, [cLw]
+        add  cx, 2
+        call dc_box
+dcb_pl: ; number plate
+        cmp  word [cW], 24
+        jb   dcr_next
+        mov  ax, [cBodyH]
+        mov  bx, 11
+        mul  bx
+        mov  bx, 20
+        div  bx
+        mov  [cT0], ax
+        mov  ax, [cBodyH]
+        mov  cl, 2
+        shr  ax, cl
+        cmp  ax, 2
+        jae  dcb8
+        mov  ax, 2
+dcb8:   add  ax, [cT0]
+        mov  [cT1], ax
+        mov  ax, [cRb]
+        cmp  ax, [cT0]
+        jb   dcr_next
+        cmp  ax, [cT1]
+        jae  dcr_next
+        mov  ax, [cW]
+        mov  cl, 3
+        shr  ax, cl
+        mov  [cHw], ax
+        mov  word [cCol], 15
+        call dc_plain
+        jmp  dcr_next
+; ---- dark underbody
+dcr_under:
+        mov  ax, [cW2]
+        sub  ax, [cRc]
+        mov  [cHw], ax
+        mov  word [cCol], 206
+        call dc_plain
+dcr_next:
+        inc  word [cR]
+        mov  ax, [cR]
+        cmp  ax, [cHt]
+        jae  dcr_end
+        jmp  dcr
+dcr_end:
+        ; ------------------------------------------------- tyres
+        mov  ax, [cW]
+        mov  cl, 3
+        shr  ax, cl
+        add  ax, 2
+        mov  [cLw], ax           ; tyre width
+        mov  ax, [cW]
+        mov  cl, 4
+        shr  ax, cl
+        mov  [cTmp], ax
+        mov  word [cR], 0
+dct:    mov  ax, [cTop]
+        add  ax, [cHt]
+        sub  ax, [cWh]
+        add  ax, [cR]
+        mov  [cY], ax
+        mov  word [cCol], 0
+        cmp  word [cR], 0
+        jne  dct1
+        mov  word [cCol], 8
+dct1:   mov  cx, [dc_cx]
+        sub  cx, [cW2]
+        add  cx, [cTmp]
+        mov  dx, cx
+        add  dx, [cLw]
+        call dc_box
+        mov  dx, [dc_cx]
+        add  dx, [cW2]
+        sub  dx, [cTmp]
+        inc  dx
+        mov  cx, dx
+        sub  cx, [cLw]
+        call dc_box
+        inc  word [cR]
+        mov  ax, [cR]
+        cmp  ax, [cWh]
+        jb   dct
+        ; ---------------------------------------------------- spoiler
+        cmp  word [cSpoil], 0
+        je   dc_done
+        mov  ax, [cHt]
+        mov  cl, 4
+        shr  ax, cl
+        cmp  ax, 2
+        jae  dcs1
+        mov  ax, 2
+dcs1:   mov  [cLw], ax           ; thickness
+        mov  word [cR], 0
+dcs2:   mov  ax, [cTop]
+        add  ax, [cCab]
+        sub  ax, [cLw]
+        add  ax, [cR]
+        mov  [cY], ax
+        mov  word [cCol], 8
+        cmp  word [cR], 0
+        jne  dcs3
+        mov  word [cCol], 7
+dcs3:   mov  ax, [cW]
+        mov  cl, 4
+        shr  ax, cl
+        mov  bx, [cW2]
+        add  bx, ax
+        mov  cx, [dc_cx]
+        sub  cx, bx
+        mov  dx, [dc_cx]
+        add  dx, bx
+        inc  dx
+        call dc_box
+        inc  word [cR]
+        mov  ax, [cR]
+        cmp  ax, [cLw]
+        jb   dcs2
+dc_done: ret
+
+; small cars far away: three simple shapes
+drawcar_small:
+        mov  ax, [dc_pnt]
+        mov  bx, ax
+        shl  ax, 1
+        add  ax, bx
+        shl  ax, 1
+        shl  ax, 1
+        add  ax, 118
+        mov  [cPb], ax
+        mov  ax, [cW]
+        mov  bx, ax
+        shl  ax, 1
+        shl  ax, 1
+        add  ax, bx
+        mov  cl, 3
+        shr  ax, cl
+        cmp  ax, 2
+        jae  dsm1
+        mov  ax, 2
+dsm1:   mov  [cHt], ax            ; height 5/8 of the width
+        shl  ax, 1
+        add  ax, [cHt]
+        mov  cl, 2
+        shr  ax, cl
+        cmp  ax, 1
+        jae  dsm2
+        mov  ax, 1
+dsm2:   mov  [cBodyH], ax
+        mov  ax, [cHt]
+        sub  ax, [cBodyH]
+        cmp  ax, 1
+        jge  dsm3
+        mov  ax, 1
+dsm3:   mov  [cCab], ax
+        mov  ax, [cW]
+        shr  ax, 1
+        mov  [cW2], ax
+        ; body
+        mov  ax, [dc_yb]
+        sub  ax, [cBodyH]
+        inc  ax
+        mov  [cTop], ax
+        mov  ax, [dc_cx]
+        sub  ax, [cW2]
+        mov  [cT0], ax
+        mov  ax, [cPb]
+        add  ax, 7
+        mov  [cCol], ax
+        RECT [cT0],[cTop],[cW],[cBodyH],[cCol]
+        ; cabin
+        mov  ax, [cTop]
+        sub  ax, [cCab]
+        mov  [cTop], ax
+        mov  ax, [cW]
+        mov  cl, 3
+        shr  ax, cl
+        mov  bx, [cT0]
+        add  bx, ax
+        mov  [cT0], bx
+        shl  ax, 1
+        mov  bx, [cW]
+        sub  bx, ax
+        mov  [cT1], bx
+        mov  ax, [cPb]
+        add  ax, 9
+        mov  [cCol], ax
+        RECT [cT0],[cTop],[cT1],[cCab],[cCol]
+        ; tail lights
+        mov  ax, [dc_yb]
+        sub  ax, [cBodyH]
+        inc  ax
+        mov  [cTop], ax
+        mov  ax, [dc_cx]
+        sub  ax, [cW2]
+        mov  [cT0], ax
+        RECT [cT0],[cTop],1,1,12
+        mov  ax, [dc_cx]
+        add  ax, [cW2]
+        dec  ax
+        mov  [cT0], ax
+        RECT [cT0],[cTop],1,1,12
+        ret
+
+; =====================================================================
 ;                    COCKPIT  (bonnet, dials, wheel)  and  HUD
 ; =====================================================================
 draw_bonnet:
+        xor  bh, bh
+        mov  bl, [selcar]
+        xor  ah, ah
+        mov  al, [car_pntof+bx]
+        mov  bx, ax
+        shl  ax, 1
+        add  ax, bx
+        shl  ax, 1
+        shl  ax, 1
+        add  ax, 118
+        mov  [c_t], ax           ; paint colours of the chosen car
         mov  word [g_y], 143
-bn1:    mov  bx, [g_y]
-        mov  ax, bx
+bn1:    mov  ax, [g_y]
         sub  ax, 143             ; r = row inside the bonnet
-        mov  si, bonnet_hw
-        add  si, ax
         mov  di, ax
+        mov  bx, 7
+        mul  bx
+        mov  bx, 23
+        div  bx                  ; 0..7 from the top of the bonnet to its bottom
+        mov  bx, 10
+        sub  bx, ax
+        add  bx, [c_t]
+        mov  [c_wc], bx          ; colour of this row
+        mov  si, bonnet_hw
+        add  si, di
         xor  ah, ah
         mov  al, [si]
         mov  cx, 160
         sub  cx, ax
         mov  dx, 160
         add  dx, ax
-        ; paint colour: smooth orange gradient from top to bottom
-        mov  ax, di
-        mov  bp, ax
-        shr  bp, 1
-        shr  bp, 1
-        add  ax, bp
-        cmp  ax, 31
-        jbe  bn2
-        mov  ax, 31
-bn2:    add  ax, 212
-        mov  ah, al
-        mov  bp, ax              ; remember the colour
-        call spandith
-bn3:    inc  word [g_y]
+        mov  ax, [c_wc]
+        mov  bx, [g_y]
+        call span
+        inc  word [g_y]
         cmp  word [g_y], 167
         jb   bn1
         ret
 
 draw_dashbase:
-        RECT 0,167,320,33,0
-        RECT 0,167,320,1,8
+        mov  word [g_y], 167
+db_g:   mov  ax, [g_y]
+        sub  ax, 167
+        shr  ax, 1
+        shr  ax, 1
+        mov  bx, 219
+        sub  bx, ax
+        mov  ax, bx
+        mov  bx, [g_y]
+        xor  cx, cx
+        mov  dx, 320
+        call span
+        inc  word [g_y]
+        cmp  word [g_y], 200
+        jb   db_g
+        RECT 0,167,320,1,221
         ; gear box
         RECT 7,175,24,22,8
         RECT 8,176,22,20,0
@@ -2990,9 +4192,20 @@ hd4:    mov  bx, [c_xc]
         mov  al, 15
         mov  ah, 1
         call puts
+        mov  ax, 121
+        mov  bx, 128
+        mov  cx, 130
+        cmp  byte [cam], 0
+        je   sy1
+        mov  ax, 42
+        mov  bx, 49
+        mov  cx, 51
+sy1:    mov  [sens_y], ax
+        mov  [sens_y2], bx
+        mov  [sens_y3], cx
         mov  si, s_sens
         mov  bx, 125
-        mov  dx, 121
+        mov  dx, [sens_y]
         mov  al, 15
         mov  ah, 1
         call puts_sh
@@ -3005,13 +4218,13 @@ hd4:    mov  bx, [c_xc]
         call num2str
         mov  bx, [t_x]
         add  bx, 6
-        mov  dx, 121
+        mov  dx, [sens_y]
         mov  al, 15
         mov  ah, 1
         call puts_sh
         mov  si, s_dot
         mov  bx, [t_x]
-        mov  dx, 121
+        mov  dx, [sens_y]
         mov  al, 15
         mov  ah, 1
         call puts_sh
@@ -3019,13 +4232,13 @@ hd4:    mov  bx, [c_xc]
         mov  cl, 1
         call num2str
         mov  bx, [t_x]
-        mov  dx, 121
+        mov  dx, [sens_y]
         mov  al, 15
         mov  ah, 1
         call puts_sh
         mov  si, s_m
         mov  bx, [t_x]
-        mov  dx, 121
+        mov  dx, [sens_y]
         mov  al, 15
         mov  ah, 1
         call puts_sh
@@ -3040,7 +4253,7 @@ sl1:    mov  cl, 2
         jbe  sl2
         mov  ax, 8
 sl2:    mov  [c_t], ax
-        RECT 123,128,83,9,0
+        RECT 123,[sens_y2],83,9,0
         xor  si, si
 sl3:    mov  ax, si
         mov  bx, 10
@@ -3058,28 +4271,319 @@ sl3:    mov  ax, si
         jb   sl4
         mov  bx, 12
 sl4:    mov  [c_wc], bx
-        RECT [c_xc],130,8,5,[c_wc]
+        RECT [c_xc],[sens_y3],8,5,[c_wc]
         inc  si
         cmp  si, 8
         jb   sl3
 hd_end: ret
 
+sens_y:  dw 121
+sens_y2: dw 128
+sens_y3: dw 130
+
+; draw_chase_hud: instruments of the chase cameras (a bar at the bottom)
+draw_chase_hud:
+        mov  word [g_y], 176
+ch1:    mov  ax, [g_y]
+        sub  ax, 176
+        shr  ax, 1
+        shr  ax, 1
+        mov  bx, 214
+        sub  bx, ax
+        mov  ax, bx
+        mov  bx, [g_y]
+        xor  cx, cx
+        mov  dx, 320
+        call span
+        inc  word [g_y]
+        cmp  word [g_y], 200
+        jb   ch1
+        RECT 0,176,320,1,221
+        ; gear
+        RECT 8,180,22,18,8
+        RECT 9,181,20,16,206
+        mov  si, s_d
+        mov  al, 10
+        cmp  word [spd], 0
+        jge  ch2
+        mov  si, s_r
+        mov  al, 12
+ch2:    mov  bx, 14
+        mov  dx, 182
+        mov  ah, 2
+        call puts
+        ; speed
+        mov  ax, [spd]
+        cmp  ax, 0
+        jge  ch3
+        neg  ax
+ch3:    mov  cl, 4
+        shr  ax, cl
+        mov  cl, 3
+        call num2str
+        mov  bx, 46
+        mov  dx, 181
+        mov  al, 14
+        mov  ah, 2
+        call puts_sh
+        mov  si, s_kmh
+        mov  bx, 86
+        mov  dx, 190
+        mov  al, 7
+        mov  ah, 1
+        call puts
+        ; fuel bar
+        mov  si, s_fuel_l
+        mov  bx, 140
+        mov  dx, 179
+        mov  al, 7
+        mov  ah, 1
+        call puts
+        RECT 140,188,94,9,8
+        RECT 141,189,92,7,206
+        mov  ax, [fuel]
+        mov  bx, 90
+        mul  bx
+        div  word [fuelmax]
+        mov  [c_t], ax
+        mov  bx, 10
+        mov  ax, [fuelmax]
+        shr  ax, 1
+        shr  ax, 1
+        cmp  [fuel], ax
+        jae  ch4
+        mov  bx, 12
+ch4:    mov  [c_wc], bx
+        RECT 142,190,[c_t],5,[c_wc]
+        ; indicators
+        mov  al, 2
+        cmp  word [wheel], 0
+        jge  ch5
+        mov  al, 10
+ch5:    mov  si, bmp_larr
+        mov  bx, 246
+        mov  dx, 182
+        call drawbmp
+        mov  al, 2
+        cmp  word [wheel], 0
+        jle  ch6
+        mov  al, 10
+ch6:    mov  si, bmp_rarr
+        mov  bx, 286
+        mov  dx, 182
+        call drawbmp
+        mov  al, 4
+        cmp  word [crash], 0
+        je   ch7
+        test byte [crash], 8
+        jz   ch7
+        mov  al, 12
+ch7:    mov  si, bmp_haz
+        mov  bx, 266
+        mov  dx, 180
+        call drawbmp
+        ret
+s_fuel_l: db "FUEL",0
+
 ; =====================================================================
-;                    PARKING LOT  and  MENU / MESSAGE PANELS
+;              PARKING LOT, MENUS, GARAGE  (smooth gradient panels)
 ; =====================================================================
 tree_y: db 52,48,55,50,53,47,54,51,49,55
+cor_tab: db 5,3,2,1,1
+car_stats: db 36,30,30,34,  44,32,34,36,  54,48,44,42,  44,34,34,24,  60,58,56,50
 s_title: db "DR. DRIVING",0
 s_lite:  db "LITE",0
 s_sub:   db "COAL FINAL PROJECT",0
 s_o1:    db "HIGHWAY",0
 s_o2:    db "PARKING",0
-s_k1:    db "1",0
-s_k2:    db "2",0
-s_hint1: db "UP GAS  SPACE BRAKE  DOWN REVERSE",0
-s_hint2: db "LEFT RIGHT STEER   ESC BACK",0
+s_o3:    db "GARAGE",0
+s_o4:    db "QUIT",0
+s_menu_h: db "UP DOWN ENTER  OR 1 2 3",0
+s_points: db "POINTS ",0
+s_carl:   db "CAR  ",0
 s_enter: db "PRESS ENTER",0
-s_scorel: db "SCORE",0
+s_scorel: db "SCORE ",0
+s_total:  db "TOTAL POINTS ",0
+s_newcar: db "NEW CAR AVAILABLE IN THE GARAGE",0
+s_paused: db "PAUSED",0
+s_p0: db "RESUME",0
+s_p1: db "RESTART",0
+s_p2: db "CAMERA",0
+s_p3: db "SMOOTH EDGES",0
+s_p4: db "MAIN MENU",0
+s_on: db "ON",0
+s_off: db "OFF",0
+s_pause_h: db "ESC RESUME   C CAMERA",0
+s_garage: db "GARAGE",0
+s_gh:     db "LEFT RIGHT CHOOSE  ENTER SELECT  ESC BACK",0
+s_owned:  db "OWNED",0
+s_sel:    db "SELECTED",0
+s_lock:   db "LOCKED  PRICE ",0
+s_nopts:  db "NOT ENOUGH POINTS",0
+s_st0: db "SPEED",0
+s_st1: db "ACCEL",0
+s_st2: db "BRAKES",0
+s_st3: db "GRIP",0
+st_names: dw s_st0,s_st1,s_st2,s_st3
+cn0: db "CITY HATCH",0
+cn1: db "SEDAN S",0
+cn2: db "COUPE R",0
+cn3: db "TREK SUV",0
+cn4: db "SUPER GT",0
+car_names: dw cn0,cn1,cn2,cn3,cn4
 
+; ------------------------------------------------- gradient panels
+; rbox: push x, y, w, h, top colour, bottom colour  - rounded, gradient
+rbox:   push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        xor  di, di              ; row
+rb1:    xor  si, si              ; inset
+        cmp  di, 5
+        jae  rb2
+        mov  bx, di
+        mov  al, [cor_tab+bx]
+        xor  ah, ah
+        mov  si, ax
+rb2:    mov  ax, [bp+8]
+        sub  ax, di
+        dec  ax
+        cmp  ax, 5
+        jae  rb3
+        mov  bx, ax
+        mov  al, [cor_tab+bx]
+        xor  ah, ah
+        mov  si, ax
+rb3:    mov  ax, [bp+4]
+        sub  ax, [bp+6]
+        imul di
+        idiv word [bp+8]
+        add  ax, [bp+6]
+        mov  bx, [bp+12]
+        add  bx, di
+        mov  cx, [bp+14]
+        add  cx, si
+        mov  dx, [bp+14]
+        add  dx, [bp+10]
+        sub  dx, si
+        call span
+        inc  di
+        cmp  di, [bp+8]
+        jb   rb1
+        pop  di
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  12
+
+%macro RBOX 6
+        PUSHV %1
+        PUSHV %2
+        PUSHV %3
+        PUSHV %4
+        PUSHV %5
+        PUSHV %6
+        call rbox
+%endmacro
+; a panel: gold frame, dark blue gradient inside
+%macro PANEL 4
+        RBOX %1-2,%2-2,%3+4,%4+4,233,227
+        RBOX %1,%2,%3,%4,236,246
+%endmacro
+
+; strlen: si = string -> cx = length
+strlen: push si
+        xor  cx, cx
+sl_1:   cmp  byte [si], 0
+        je   sl_2
+        inc  si
+        inc  cx
+        jmp  sl_1
+sl_2:   pop  si
+        ret
+
+; putsc: centred text. si = string, dx = y, al = colour, ah = scale
+putsc:  push bx
+        push cx
+        push dx
+        push ax
+        call strlen              ; cx = number of letters
+        mov  al, ah
+        xor  ah, ah
+        mov  bx, 6
+        mul  bx
+        mul  cx                  ; width = letters * 6 * scale
+        shr  ax, 1
+        mov  bx, 160
+        sub  bx, ax
+        pop  ax
+        pop  dx
+        call puts_sh
+        pop  cx
+        pop  bx
+        ret
+
+
+; mkline: si = label text, ax = number  ->  si = "label number" (one string)
+mkline: push ax
+        push bx
+        push di
+        mov  di, linebuf
+mk1:    mov  bl, [si]
+        or   bl, bl
+        jz   mk2
+        mov  [di], bl
+        inc  si
+        inc  di
+        jmp  mk1
+mk2:    mov  cl, 1
+        call num2str
+mk3:    mov  bl, [si]
+        mov  [di], bl
+        inc  si
+        inc  di
+        or   bl, bl
+        jnz  mk3
+        mov  si, linebuf
+        pop  di
+        pop  bx
+        pop  ax
+        ret
+linebuf: times 40 db 0
+
+; goldtext: three layers (shadow, dark gold, bright gold) - elegant title
+goldtext:
+        push ax
+        push bx
+        push dx
+        add  bx, 2
+        add  dx, 2
+        mov  al, 0
+        call puts
+        pop  dx
+        pop  bx
+        push bx
+        push dx
+        inc  bx
+        inc  dx
+        mov  al, 229
+        call puts
+        pop  dx
+        pop  bx
+        pop  ax
+        mov  al, 233
+        call puts
+        ret
+
+; ------------------------------------------------------------ parking
 ; bayx: ax = world x  ->  ax = screen x at the current row (uses [px], [g_lw])
 bayx:   sub  ax, [px]
         imul word [g_lw]
@@ -3091,10 +4595,12 @@ bayx:   sub  ax, [px]
 draw_sky_park:
         mov  cx, 80
         call skyrows
-        RECT 40,18,30,4,15
-        RECT 30,22,52,4,15
-        RECT 220,30,26,4,15
-        RECT 210,34,48,4,15
+        mov  bx, 36
+        mov  dx, 24
+        call cloud
+        mov  bx, 215
+        mov  dx, 34
+        call cloud
         ; row of trees behind the fence
         xor  si, si
 tp1:    mov  ax, si
@@ -3117,15 +4623,15 @@ tp1:    mov  ax, si
         cmp  si, 10
         jb   tp1
         ; concrete fence
-        RECT 0,80,320,8,7
+        RECT 0,80,320,8,219
         RECT 0,80,320,1,15
-        RECT 0,87,320,1,8
+        RECT 0,87,320,1,212
         xor  si, si
 tp2:    mov  ax, si
         mov  cl, 4
         shl  ax, cl
         mov  [c_xc], ax
-        RECT [c_xc],81,2,6,8
+        RECT [c_xc],81,2,6,210
         inc  si
         cmp  si, 20
         jb   tp2
@@ -3136,27 +4642,33 @@ draw_ground_park:
 gp_row: mov  ax, [g_y]
         sub  ax, 87
         mov  [g_k], ax
-        shl  ax, 1
-        add  ax, 20
+        mul  word [cam_lwm]
+        mov  cl, 3
+        shr  ax, cl
+        add  ax, [cam_lwa]
         mov  [g_lw], ax
         mov  bx, [g_k]
-        xor  dx, dx
-        mov  ax, 18560           ; 290 m * 64
+        cmp  bx, [cam_kmin]
+        jae  gp0
+        mov  bx, [cam_kmin]
+gp0:    mov  dx, [cam_hi]
+        mov  ax, [cam_lo]
         div  bx
         add  ax, [pz]
         sub  ax, 115
+        sub  ax, [cam_cb]
         mov  [g_zw], ax
         mov  bx, [g_y]
         mov  ax, [g_k]
         shr  ax, 1
-        cmp  ax, 31
+        shr  ax, 1
+        cmp  ax, 23
         jbe  gp1a
-        mov  ax, 31
-gp1a:   add  ax, 84
-        mov  ah, al
+        mov  ax, 23
+gp1a:   add  ax, 38
         xor  cx, cx
         mov  dx, 320
-        call spandith
+        call span
         mov  ax, [g_zw]
         cmp  ax, 576
         jl   gp_nx
@@ -3177,38 +4689,38 @@ gp1a:   add  ax, 84
         call bayx
         mov  [g_xr], ax
         mov  bx, [g_y]
-        mov  ax, 0x0202
+        mov  al, 2
         mov  cx, [g_xl]
         mov  dx, [g_xr]
-        call spandith
-        mov  ax, 0x0F0F
+        call span
+        mov  al, 15
         mov  cx, [g_xl]
         mov  dx, cx
         add  dx, [g_ew]
-        call spandith
+        call span
         mov  dx, [g_xr]
         mov  cx, dx
         sub  cx, [g_ew]
-        call spandith
+        call span
         cmp  word [g_zw], 616
         jge  gp2
         mov  cx, [g_xl]
         mov  dx, [g_xr]
-        call spandith
+        call span
 gp2:    mov  ax, -56
         call bayx
         mov  cx, ax
         mov  dx, ax
         add  dx, [g_ew]
-        mov  ax, 0x0F0F
-        call spandith
+        mov  al, 15
+        call span
         mov  ax, 184
         call bayx
         mov  cx, ax
         mov  dx, ax
         add  dx, [g_ew]
-        mov  ax, 0x0F0F
-        call spandith
+        mov  al, 15
+        call span
         jmp  gp_nx
 gp_curb:
         mov  ax, -60
@@ -3219,25 +4731,24 @@ gp_curb:
         mov  dx, ax
         pop  cx
         mov  bx, [g_y]
-        mov  ax, 0x0E0E
-        call spandith
+        mov  al, 14
+        call span
 gp_nx:  inc  word [g_y]
-        cmp  word [g_y], 167
+        mov  ax, [cam_gnd]
+        cmp  [g_y], ax
         jae  gp_dn
         jmp  gp_row
 gp_dn:  ret
 
-; park_proj: [pp_x] = world x, [pp_z] = world z  ->  dc_cx, dc_yb, g_lw
-;            carry set when the object is not visible
-park_proj:
-        mov  ax, [pz]
-        sub  ax, 115
-        mov  bx, [pp_z]
-        sub  bx, ax
+; park_zproj: bx = distance seen from the camera
+;             -> g_k, g_lw, dc_yb ; carry set when not visible
+park_zproj:
         cmp  bx, 200
         jl   pj_no
-        xor  dx, dx
-        mov  ax, 18560
+        mov  dx, [cam_hi]
+        mov  ax, [cam_lo]
+        cmp  dx, bx
+        jae  pj_no
         div  bx
         cmp  ax, 1
         jl   pj_no
@@ -3245,16 +4756,32 @@ park_proj:
         add  ax, 87
         mov  [dc_yb], ax
         mov  ax, [g_k]
-        shl  ax, 1
-        add  ax, 20
+        mul  word [cam_lwm]
+        mov  cl, 3
+        shr  ax, cl
+        add  ax, [cam_lwa]
         mov  [g_lw], ax
-        mov  ax, [pp_x]
-        call bayx
-        mov  [dc_cx], ax
         clc
         ret
 pj_no:  stc
         ret
+
+; park_proj: [pp_x] = world x, [pp_z] = world z -> dc_cx, dc_yb, g_lw
+park_proj:
+        mov  bx, [pp_z]
+        sub  bx, [pz]
+        add  bx, 115
+        add  bx, [cam_cb]
+        call park_zproj
+        jc   pj_x
+        mov  ax, [pp_x]
+        call bayx
+        mov  [dc_cx], ax
+        clc
+pj_x:   ret
+
+pp_pnt: dw 0
+pp_des: dw 0
 
 ; a parked car seen from behind
 park_car:
@@ -3268,8 +4795,49 @@ park_car:
         mov  cl, 3
         shr  ax, cl
         mov  [dc_lw], ax
+        mov  ax, [pp_pnt]
+        mov  [dc_pnt], ax
+        mov  ax, [pp_des]
+        mov  [dc_des], ax
+        mov  word [dc_brk], 0
         call drawcar
 pc_x:   ret
+
+; the car you drive, in the chase cameras
+draw_player_park:
+        mov  bx, [cam_cb]
+        sub  bx, 167
+        call park_zproj
+        jc   dpp_x
+        mov  ax, [g_lw]
+        mov  bx, ax
+        shl  ax, 1
+        shl  ax, 1
+        add  ax, bx
+        mov  cl, 3
+        shr  ax, cl
+        mov  [dc_lw], ax
+        mov  ax, [wheel]
+        mov  bx, 3
+        imul bx
+        add  ax, 160
+        mov  [dc_cx], ax
+        call player_look
+dpp_x:  mov  word [pdrawn], 1
+        ret
+
+; draws your car first if the next object is nearer than it: ax = object z
+maybe_player:
+        cmp  byte [cam], 0
+        je   mp_x
+        cmp  word [pdrawn], 0
+        jne  mp_x
+        mov  bx, [pz]
+        sub  bx, 282
+        cmp  bx, ax
+        jle  mp_x
+        call draw_player_park
+mp_x:   ret
 
 ; traffic cone
 park_cone:
@@ -3336,18 +4904,21 @@ pk4:    mov  [c_t], ax
         mov  ax, [dc_yb]
         sub  ax, [c_bh]
         mov  [c_ytb], ax
-        RECT [c_x0],[c_ytb],[c_W],[c_bh],0
+        RECT [c_x0],[c_ytb],[c_W],[c_bh],206
 pk_x:   ret
 
 draw_park_objects:
+        mov  word [pdrawn], 0
         ; big letter P in the bay
-        mov  ax, [pz]
         mov  bx, 899
-        sub  bx, ax              ; distance to the middle of the bay
+        sub  bx, [pz]
+        add  bx, [cam_cb]        ; distance to the middle of the bay
         cmp  bx, 300
         jl   dpo1
-        xor  dx, dx
-        mov  ax, 18560
+        mov  dx, [cam_hi]
+        cmp  dx, bx
+        jae  dpo1
+        mov  ax, [cam_lo]
         div  bx
         cmp  ax, 70
         jg   dpo1
@@ -3355,8 +4926,10 @@ draw_park_objects:
         add  ax, 87
         mov  [dc_yb], ax
         mov  ax, [g_k]
-        shl  ax, 1
-        add  ax, 20
+        mul  word [cam_lwm]
+        mov  cl, 3
+        shr  ax, cl
+        add  ax, [cam_lwa]
         mov  [g_lw], ax
         mov  ax, 64
         call bayx
@@ -3368,7 +4941,10 @@ draw_park_objects:
         cmp  word [g_k], 14
         jge  dpo2
         mov  ah, 1
-dpo2:   mov  [t_sc], ah
+dpo2:   cmp  byte [cam], 0
+        je   dpo3
+        mov  ah, 1               ; chase cameras see the bay flat: small letter
+dpo3:   mov  [t_sc], ah
         xor  ah, ah
         mov  al, [t_sc]
         mov  bx, 3
@@ -3384,41 +4960,57 @@ dpo2:   mov  [t_sc], ah
 dpo1:   ; far parked cars
         mov  word [pp_x], 0
         mov  word [pp_z], 2300
-        mov  word [dc_col], 4
+        mov  word [pp_pnt], 2
+        mov  word [pp_des], 1
         call park_car
         mov  word [pp_x], 116
         mov  word [pp_z], 2700
-        mov  word [dc_col], 15
+        mov  word [pp_pnt], 5
+        mov  word [pp_des], 0
         call park_car
         mov  word [pp_x], -70
         mov  word [pp_z], 2500
-        mov  word [dc_col], 14
+        mov  word [pp_pnt], 4
+        mov  word [pp_des], 2
         call park_car
         mov  word [pp_x], 60
         mov  word [pp_z], 3000
-        mov  word [dc_col], 3
+        mov  word [pp_pnt], 1
+        mov  word [pp_des], 3
         call park_car
         mov  word [pp_x], 170
         mov  word [pp_z], 2400
-        mov  word [dc_col], 9
+        mov  word [pp_pnt], 3
+        mov  word [pp_des], 4
         call park_car
         ; neighbours of the bay
+        mov  ax, 595
+        call maybe_player
         mov  word [pp_x], -16
         mov  word [pp_z], 595
-        mov  word [dc_col], 15
+        mov  word [pp_pnt], 5
+        mov  word [pp_des], 1
         call park_car
         mov  word [pp_x], 144
         mov  word [pp_z], 595
-        mov  word [dc_col], 4
+        mov  word [pp_pnt], 2
+        mov  word [pp_des], 3
         call park_car
         ; cones at the bay entrance
+        mov  ax, 576
+        call maybe_player
         mov  word [pp_x], 20
         mov  word [pp_z], 576
         call park_cone
         mov  word [pp_x], 108
         mov  word [pp_z], 576
         call park_cone
-        ret
+        cmp  byte [cam], 0
+        je   dpo9
+        cmp  word [pdrawn], 0
+        jne  dpo9
+        call draw_player_park
+dpo9:   ret
 
 render_parking:
         call draw_sky_park
@@ -3426,203 +5018,375 @@ render_parking:
         call draw_park_objects
         ret
 
-; ---------------------------------------------------------------- menu
-; frame: draws a panel with a brown border and a thin orange line inside
-; push x, y, w, h
-panel:  push bp
-        mov  bp, sp
-        push ax
-        mov  ax, [bp+10]
-        mov  [c_x0], ax
-        mov  ax, [bp+8]
-        mov  [c_ytb], ax
-        mov  ax, [bp+6]
-        mov  [c_W], ax
-        mov  ax, [bp+4]
-        mov  [c_H], ax
-        RECT [c_x0],[c_ytb],[c_W],[c_H],6
-        mov  ax, [c_x0]
-        add  ax, 2
-        mov  [c_x0], ax
-        mov  ax, [c_ytb]
-        add  ax, 2
-        mov  [c_ytb], ax
-        sub  word [c_W], 4
-        sub  word [c_H], 4
-        RECT [c_x0],[c_ytb],[c_W],[c_H],0
-        add  word [c_x0], 3
-        add  word [c_ytb], 3
-        sub  word [c_W], 6
-        sub  word [c_H], 6
-        RECT [c_x0],[c_ytb],[c_W],1,12
-        mov  ax, [c_ytb]
-        add  ax, [c_H]
-        dec  ax
-        mov  [c_t], ax
-        RECT [c_x0],[c_t],[c_W],1,12
-        RECT [c_x0],[c_ytb],1,[c_H],12
-        mov  ax, [c_x0]
-        add  ax, [c_W]
-        dec  ax
-        mov  [c_t], ax
-        RECT [c_t],[c_ytb],1,[c_H],12
-        pop  ax
-        pop  bp
-        ret  8
-
-; text with a three layer "gold" look: dark red, brown, bright
-goldtext:
+; ------------------------------------------------------------ main menu
+; menu_item: si = text, dx = y, al = item number
+menu_item:
         push ax
         push bx
         push dx
-        add  bx, 2
+        cmp  al, [msel]
+        jne  mi1
+        mov  [c_t], dx
+        RBOX 84,[c_t],152,17,243,238
+        pop  dx
+        pop  bx
+        pop  ax
+        push ax
+        push bx
+        push dx
+        mov  al, 233
+        jmp  mi2
+mi1:    mov  al, 7
+mi2:    mov  bx, 112
         add  dx, 2
-        mov  al, 4
-        call puts
-        pop  dx
-        pop  bx
-        push bx
-        push dx
-        inc  bx
-        inc  dx
-        mov  al, 6
-        call puts
+        mov  ah, 2
+        call puts_sh
         pop  dx
         pop  bx
         pop  ax
-        call puts
         ret
 
 draw_menu:
-        PUSHV 40
-        PUSHV 28
-        PUSHV 240
-        PUSHV 148
-        call panel
+        PANEL 60,24,200,166
         mov  si, s_title
         mov  bx, 62
-        mov  dx, 40
-        mov  al, 14
+        mov  dx, 32
+        mov  al, 233
         mov  ah, 3
         call goldtext
         mov  si, s_lite
         mov  bx, 137
-        mov  dx, 66
-        mov  al, 12
+        mov  dx, 56
         mov  ah, 2
         call goldtext
         mov  si, s_sub
-        mov  bx, 106
-        mov  dx, 87
+        mov  dx, 76
         mov  al, 7
         mov  ah, 1
-        call puts
-        RECT 70,98,180,1,8
-        mov  si, s_k1
-        mov  bx, 90
-        mov  dx, 107
-        mov  al, 14
-        mov  ah, 2
-        call puts_sh
+        call putsc
+        RECT 84,88,152,1,230
         mov  si, s_o1
-        mov  bx, 116
-        mov  dx, 107
-        mov  al, 15
-        mov  ah, 2
-        call puts_sh
-        mov  si, s_k2
-        mov  bx, 90
-        mov  dx, 129
-        mov  al, 14
-        mov  ah, 2
-        call puts_sh
-        mov  si, s_o2
-        mov  bx, 116
-        mov  dx, 129
-        mov  al, 15
-        mov  ah, 2
-        call puts_sh
-        mov  si, s_hint1
-        mov  bx, 61
-        mov  dx, 150
-        mov  al, 7
-        mov  ah, 1
-        call puts
-        mov  si, s_hint2
-        mov  bx, 79
-        mov  dx, 160
-        mov  al, 8
-        mov  ah, 1
-        call puts
-        ret
-
-draw_endpanel:
-        PUSHV 50
-        PUSHV 58
-        PUSHV 220
-        PUSHV 78
-        call panel
-        ; centre the title
-        mov  si, [msg_t]
-        xor  cx, cx
-es1:    cmp  byte [si], 0
-        je   es2
-        inc  si
-        inc  cx
-        jmp  es1
-es2:    mov  ax, cx
-        mov  bx, 12
-        mul  bx
-        sub  ax, 2
-        shr  ax, 1
-        mov  bx, 160
-        sub  bx, ax
-        mov  si, [msg_t]
-        mov  dx, 70
-        mov  al, [msg_c]
-        mov  ah, 2
-        call puts_sh
-        ; score line, centred: width = (6 + digits) * 12
-        mov  ax, [score]
-        mov  cl, 1
-        call num2str
-        xor  cx, cx
-es4:    cmp  byte [si], 0
-        je   es5
-        inc  si
-        inc  cx
-        jmp  es4
-es5:    add  cx, 6
-        mov  ax, cx
-        mov  bx, 6
-        mul  bx
-        mov  bx, 160
-        sub  bx, ax
-        push bx
-        mov  si, s_scorel
         mov  dx, 94
-        mov  al, 14
-        mov  ah, 2
+        xor  al, al
+        call menu_item
+        mov  si, s_o2
+        mov  dx, 112
+        mov  al, 1
+        call menu_item
+        mov  si, s_o3
+        mov  dx, 130
+        mov  al, 2
+        call menu_item
+        mov  si, s_o4
+        mov  dx, 148
+        mov  al, 3
+        call menu_item
+        ; points and chosen car
+        mov  si, s_points
+        mov  bx, 70
+        mov  dx, 170
+        mov  al, 233
+        mov  ah, 1
         call puts_sh
-        mov  ax, [score]
+        mov  ax, [bank]
         mov  cl, 1
         call num2str
         mov  bx, [t_x]
-        add  bx, 12
-        mov  dx, 94
+        mov  dx, 170
         mov  al, 15
-        mov  ah, 2
+        mov  ah, 1
         call puts_sh
+        xor  bh, bh
+        mov  bl, [selcar]
+        shl  bx, 1
+        mov  si, [car_names+bx]
+        mov  bx, 180
+        mov  dx, 170
+        mov  al, 14
+        mov  ah, 1
+        call puts_sh
+        mov  si, s_menu_h
+        mov  dx, 180
+        mov  al, 8
+        mov  ah, 1
+        call putsc
+        ret
+
+; ----------------------------------------------------------- pause menu
+pause_item:
+        push ax
+        push bx
+        push dx
+        cmp  al, [psel]
+        jne  pi1
+        mov  [c_t], dx
+        RBOX 94,[c_t],132,14,243,238
+pi1:    pop  dx
         pop  bx
-        test byte [ticks], 32
-        jz   es3
-        mov  si, s_enter
-        mov  bx, 128
-        mov  dx, 118
-        mov  al, 7
+        pop  ax
+        push ax
+        push bx
+        push dx
+        mov  bx, 102
+        add  dx, 3
+        mov  al, 15
+        mov  ah, 1
+        call puts_sh
+        pop  dx
+        pop  bx
+        pop  ax
+        ret
+
+draw_pause:
+        PANEL 80,36,160,132
+        mov  si, s_paused
+        mov  dx, 44
+        mov  al, 233
+        mov  ah, 2
+        call putsc
+        mov  si, s_p0
+        mov  dx, 70
+        xor  al, al
+        call pause_item
+        mov  si, s_p1
+        mov  dx, 86
+        mov  al, 1
+        call pause_item
+        mov  si, s_p2
+        mov  dx, 102
+        mov  al, 2
+        call pause_item
+        xor  bh, bh
+        mov  bl, [cam]
+        shl  bx, 1
+        mov  si, [cam_names+bx]
+        mov  bx, 168
+        mov  dx, 105
+        mov  al, 14
         mov  ah, 1
         call puts
-es3:    ret
+        mov  si, s_p3
+        mov  dx, 118
+        mov  al, 3
+        call pause_item
+        mov  si, s_on
+        cmp  byte [smooth], 0
+        jne  dp1
+        mov  si, s_off
+dp1:    mov  bx, 200
+        mov  dx, 121
+        mov  al, 14
+        mov  ah, 1
+        call puts
+        mov  si, s_p4
+        mov  dx, 134
+        mov  al, 4
+        call pause_item
+        mov  si, s_pause_h
+        mov  dx, 156
+        mov  al, 8
+        mov  ah, 1
+        call putsc
+        ret
+
+; ------------------------------------------------------------ end panel
+draw_endpanel:
+        PANEL 50,50,220,104
+        mov  si, [msg_t]
+        mov  dx, 60
+        mov  al, [msg_c]
+        mov  ah, 2
+        call putsc
+        mov  si, s_scorel
+        mov  ax, [earned]
+        call mkline
+        mov  dx, 86
+        mov  al, 14
+        mov  ah, 2
+        call putsc
+        mov  si, s_total
+        mov  ax, [bank]
+        call mkline
+        mov  dx, 108
+        mov  al, 233
+        mov  ah, 1
+        call putsc
+        ; is there a car you can afford now?
+        xor  si, si
+ep1:    mov  al, 1
+        mov  cx, si
+        shl  al, cl
+        test [unl], al
+        jnz  ep2
+        mov  bx, si
+        shl  bx, 1
+        mov  ax, [bank]
+        cmp  ax, [car_price+bx]
+        jb   ep2
+        mov  si, s_newcar
+        mov  dx, 122
+        mov  al, 10
+        mov  ah, 1
+        call putsc
+        jmp  ep3
+ep2:    inc  si
+        cmp  si, 5
+        jb   ep1
+ep3:    test byte [ticks], 32
+        jz   ep9
+        mov  si, s_enter
+        mov  dx, 138
+        mov  al, 7
+        mov  ah, 1
+        call putsc
+ep9:    ret
+
+; ------------------------------------------------------------- garage
+render_garage:
+        ; background: deep blue gradient
+        xor  bx, bx
+rg1:    mov  ax, bx
+        mov  cl, 4
+        shr  ax, cl
+        add  ax, 234
+        xor  cx, cx
+        mov  dx, 320
+        call span
+        inc  bx
+        cmp  bx, 200
+        jb   rg1
+        mov  si, s_garage
+        mov  dx, 8
+        mov  al, 233
+        mov  ah, 2
+        call putsc
+        ; points
+        mov  si, s_points
+        mov  bx, 214
+        mov  dx, 10
+        mov  al, 233
+        mov  ah, 1
+        call puts_sh
+        mov  ax, [bank]
+        mov  cl, 1
+        call num2str
+        mov  bx, [t_x]
+        mov  dx, 10
+        mov  al, 15
+        mov  ah, 1
+        call puts_sh
+        ; spot light and podium
+        RBOX 70,150,180,16,222,214
+        RBOX 70,148,180,3,230,233
+        xor  bh, bh
+        mov  bl, [gsel]
+        mov  al, [car_dsgof+bx]
+        xor  ah, ah
+        mov  [dc_des], ax
+        mov  al, [car_pntof+bx]
+        xor  ah, ah
+        mov  [dc_pnt], ax
+        mov  word [dc_brk], 0
+        mov  word [dc_cx], 160
+        mov  word [dc_yb], 146
+        mov  word [dc_lw], 150
+        call drawcar
+        ; arrows
+        mov  si, s_larr
+        mov  bx, 16
+        mov  dx, 100
+        mov  al, 233
+        mov  ah, 3
+        call puts_sh
+        mov  si, s_rarr
+        mov  bx, 288
+        mov  dx, 100
+        mov  al, 233
+        mov  ah, 3
+        call puts_sh
+        ; name
+        xor  bh, bh
+        mov  bl, [gsel]
+        shl  bx, 1
+        mov  si, [car_names+bx]
+        mov  dx, 172
+        mov  al, 15
+        mov  ah, 2
+        call putsc
+        ; stats
+        xor  di, di
+rg2:    mov  ax, di
+        mov  bx, 11
+        mul  bx
+        add  ax, 36
+        mov  [c_yc], ax
+        mov  bx, di
+        shl  bx, 1
+        mov  si, [st_names+bx]
+        mov  bx, 8
+        mov  dx, [c_yc]
+        mov  al, 7
+        mov  ah, 1
+        call puts_sh
+        RECT 46,[c_yc],54,6,236
+        xor  bh, bh
+        mov  bl, [gsel]
+        shl  bx, 1
+        shl  bx, 1
+        add  bx, di
+        xor  ah, ah
+        mov  al, [car_stats+bx]
+        mov  [c_t], ax
+        mov  ax, [c_yc]
+        inc  ax
+        mov  [c_wc], ax
+        RECT 47,[c_wc],[c_t],4,232
+        inc  di
+        cmp  di, 4
+        jb   rg2
+        ; status line
+        mov  al, 1
+        mov  cl, [gsel]
+        shl  al, cl
+        test [unl], al
+        jnz  rg3
+        mov  si, s_lock
+        xor  bh, bh
+        mov  bl, [gsel]
+        shl  bx, 1
+        mov  ax, [car_price+bx]
+        call mkline
+        mov  dx, 188
+        mov  al, 12
+        mov  ah, 1
+        call putsc
+        jmp  rg5
+rg3:    mov  si, s_owned
+        mov  al, [gsel]
+        cmp  al, [selcar]
+        jne  rg4
+        mov  si, s_sel
+rg4:    mov  dx, 188
+        mov  al, 10
+        mov  ah, 1
+        call putsc
+rg5:    cmp  word [gmsg], 0
+        je   rg6
+        test byte [ticks], 8
+        jz   rg6
+        mov  si, s_nopts
+        mov  dx, 124
+        mov  al, 12
+        mov  ah, 2
+        call putsc
+rg6:    mov  si, s_gh
+        mov  dx, 24
+        mov  al, 8
+        mov  ah, 1
+        call putsc
+        ret
+s_larr: db "<",0
+s_rarr: db ">",0
 
 
 ; =====================================================================
@@ -3658,7 +5422,7 @@ fontdata:
     db 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C      ; '9'
     db 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00      ; ':'
     db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00      ; ';'
-    db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00      ; '<'
+    db 0x01, 0x02, 0x04, 0x08, 0x04, 0x02, 0x01      ; '<'
     db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00      ; '='
     db 0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10      ; '>'
     db 0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04      ; '?'
