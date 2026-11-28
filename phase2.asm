@@ -1,15 +1,11 @@
 ; =====================================================================
 ;  DR. DRIVING LITE  -  COAL Final Project  (8088 assembly, NASM, .COM)
-;  Build :  nasm drdriving.asm -o drdriving.com
+;  PHASE 2 : HIGHWAY DRIVING AND COLLISIONS
+;  Build :  nasm phase2.asm -o phase2.com
 ;
-;  Only 8088 instructions and techniques from the course book are used:
-;    - BIOS video service (INT 10h, mode 13h), VGA colour registers (ports)
-;    - hooked keyboard (INT 9) and timer (INT 8) interrupts, the PIT
-;    - DOS file services (INT 21h) to keep your points and cars
-;    - string instructions (STOS, MOVS, CMPS), stack parameters, tables
-;
-;  Menu: UP / DOWN / ENTER.  Game: UP gas, SPACE brake, DOWN reverse,
-;  LEFT / RIGHT lanes (steer), C camera, ESC pause menu.
+;  UP gas, SPACE brake, DOWN reverse (only at speed 0), LEFT / RIGHT change
+;  lane.  1000 m to go before the time or the fuel runs out.  A crash stops
+;  the car and costs 50 points.  ESC = leave.
 ; =====================================================================
 cpu 8086
 bits 16
@@ -20,6 +16,7 @@ bits 16
         mov ax, %1
         push ax
 %endmacro
+
 ; RECT x, y, w, h, colour  -> fillrect (uses AX)
 %macro RECT 5
         PUSHV %1
@@ -31,6 +28,7 @@ bits 16
 %endmacro
 
 ; ---------------------------------------------------------------- data
+
 bseg:       dw 0                ; segment of the back buffer (frame being drawn)
 fseg:       dw 0                ; segment of the front buffer (what is on screen)
 oldkb:      dd 0
@@ -155,7 +153,6 @@ start:
         int  0x10
         call setpal
         call build_invmap
-        call load_game
         call game_init
         mov  ax, [ticks]
         mov  [lasttick], ax
@@ -695,70 +692,9 @@ invd_new: db 0
 invd:    times 4096 db 0
 invnew:  times 4096 db 0
 
-; ------------------------------------------------ saved game (DOS files)
-savefile: db "DRDRIVE.SAV",0
-sv_sig:   db 0
-bank:     dw 0                  ; points collected
-unl:      db 1                  ; bit mask of the unlocked cars
+; ------------------------------------------------------------ settings
 selcar:   db 0
-usercam:  db 1
 smooth:   db 1
-sv_end:
-SAVELEN   equ 7
-
-save_game:
-        push ax
-        push bx
-        push cx
-        push dx
-        mov  byte [sv_sig], 0xD5
-        mov  dx, savefile
-        xor  cx, cx
-        mov  ah, 0x3C            ; create file
-        int  0x21
-        jc   sv_x
-        mov  bx, ax
-        mov  dx, sv_sig
-        mov  cx, SAVELEN
-        mov  ah, 0x40            ; write
-        int  0x21
-        mov  ah, 0x3E            ; close
-        int  0x21
-sv_x:   pop  dx
-        pop  cx
-        pop  bx
-        pop  ax
-        ret
-
-load_game:
-        push ax
-        push bx
-        push cx
-        push dx
-        mov  dx, savefile
-        mov  ax, 0x3D00          ; open for reading
-        int  0x21
-        jc   ld_x
-        mov  bx, ax
-        mov  dx, sv_sig
-        mov  cx, SAVELEN
-        mov  ah, 0x3F            ; read
-        int  0x21
-        mov  ah, 0x3E
-        int  0x21
-        cmp  byte [sv_sig], 0xD5
-        je   ld_x
-        mov  word [bank], 0      ; not our file: start from scratch
-        mov  byte [unl], 1
-        mov  byte [selcar], 0
-        mov  byte [usercam], 1
-        mov  byte [smooth], 1
-ld_x:   pop  dx
-        pop  cx
-        pop  bx
-        pop  ax
-        ret
-
 ; ---------------------------------------------------------- primitives
 ; span: bx = y, cx = x1, dx = x2 (exclusive), al = colour. es = back buffer
 span:   push cx
@@ -787,49 +723,6 @@ sp2:    sub  dx, cx
         stosb
 sp_ev:  pop  ax
 sp_end: pop  di
-        pop  dx
-        pop  cx
-        ret
-
-; spandith: like span but two colours (al, ah) in a checker pattern
-spandith:
-        push cx
-        push dx
-        push di
-        push ax
-        cmp  bx, 200
-        jae  sd_end
-        cmp  cx, 0
-        jge  sd1
-        xor  cx, cx
-sd1:    cmp  dx, 320
-        jle  sd2
-        mov  dx, 320
-sd2:    cmp  dx, cx
-        jle  sd_end
-        mov  di, bx
-        shl  di, 1
-        mov  di, [rowtab+di]
-        test bl, 1
-        jz   sd3
-        xchg al, ah
-sd3:    add  di, cx
-        sub  dx, cx
-        test cl, 1
-        jz   sd4
-        mov  [es:di], ah
-        inc  di
-        dec  dx
-        jz   sd_end
-sd4:    mov  cx, dx
-        shr  cx, 1
-        jz   sd5
-        rep  stosw
-sd5:    test dl, 1
-        jz   sd_end
-        mov  [es:di], al
-sd_end: pop  ax
-        pop  di
         pop  dx
         pop  cx
         ret
@@ -1305,14 +1198,7 @@ PERIOD  equ 15680               ; length of the traffic ring (245 m, 1 m = 64 un
 ZLOW    equ 384
 
 quitflag: db 0
-state:    db 0                  ; 0 menu, 1 highway, 2 parking, 3 message, 4 garage, 5 pause
-cam:      db 0                  ; camera: 0 cockpit, 1 chase, 2 high chase
-camnote:  dw 0
-msel:     db 0                  ; selected line of the main menu
-psel:     db 0                  ; selected line of the pause menu
-gsel:     db 0                  ; car shown in the garage
-gmsg:     dw 0                  ; garage message timer
-earned:   dw 0
+state:    db 0                  ; 1 highway, 3 message
 glide:    dw 4                  ; sideways speed of the camera (car handling)
 cam_hi:   dw 1
 cam_lo:   dw 0x5E00
@@ -1322,23 +1208,11 @@ cam_cb:   dw 0
 cam_gnd:  dw 167
 cam_jmin: dw 0
 cam_kmin: dw 2
-; the cars you can drive
-car_vmax:  dw 2240,2400,2640,2400,3040
-car_acc:   db 7,7,6,7,6
-car_brk:   dw 24,26,30,26,36
-car_glide: dw 4,4,5,3,6
-car_price: dw 0,2500,6000,10000,16000
 car_pntof: db 0,1,2,3,4
-car_dsgof: db 0,1,2,3,4
-; camera tables: hi, lo (distance constant), lane scale, lane base, camera back, last ground row, first building
+; camera numbers of the cockpit view: hi, lo (distance constant), lane scale,
+; lane base, camera back, last ground row, first building
 camh_tab: dw 1,0x5E00,8,7,0,167,0
-          dw 2,43228,5,7,800,200,-1
-          dw 4,1856,4,7,2000,200,-2
-camp_tab: dw 0,18560,16,20,0,167,0
-          dw 0,55000,8,15,900,200,0
-          dw 1,39464,6,12,1500,200,0
 
-scene:    db 1                  ; which world is drawn: 1 highway, 2 parking
 spd:      dw 0                  ; speed, 1/16 km/h, negative = reversing
 vmax:     dw 2240
 accsh:    db 7
@@ -1363,53 +1237,17 @@ crash:    dw 0
 endtimer: dw 0
 msg_t:    dw 0
 msg_c:    db 12
-px:       dw 100                ; parking: sideways position
-pz:       dw 0                  ; parking: front bumper position (1/64 m)
-pcool:    dw 0
-sensor:   dw 99                 ; parking sensor, decimetres
-hitflag:  db 0
-par:      db 0
-oldpz:    dw 0
-oldpx:    dw 0
-
 car_z:    times NC dw 0
 car_lane: dw 1,0,2,2,1,0,0,1,2,1
 car_pnt:  dw 1,5,3,2,4,0,1,3,2,5       ; paint of every traffic car
 car_des:  dw 1,0,3,2,4,1,0,2,3,1       ; body shape of every traffic car
 car_off:  dw 0,2240,2240,4480,6720,6720,8960,11200,11200,13440
 
-; parking obstacles: x0, x1, z0, z1
-pobst:  dw -33,1,595,890         ; parked car on the left
-        dw 127,161,595,890       ; parked car on the right
-        dw 16,24,550,602         ; cone, left
-        dw 104,112,550,602       ; cone, right
-        dw -60,190,998,1024      ; wheel stop at the back of the bay
-
 ; =====================================================================
 ;                              GAME LOGIC
 ; =====================================================================
 game_init:
-        call menu_reset
-        ret
-
-menu_reset:
-        mov  byte [state], 0
-        mov  byte [scene], 1
-        mov  byte [cam], 1
-        call set_cam
-        call apply_car
-        mov  word [spd], 1100
-        mov  word [odo], 0
-        mov  word [camu], 64
-        mov  word [wheel], 0
-        mov  word [score], 0
-        mov  word [timeleft], 4800
-        mov  word [timetotal], 4800
-        mov  word [fuel], 30000
-        mov  word [fuelmax], 36000
-        mov  word [crash], 0
-        call cars_init
-        mov  byte [lastkey], 0
+        call hwy_start
         ret
 
 cars_init:
@@ -1426,37 +1264,19 @@ game_update:
         mov  al, [state]
         cmp  al, 1
         je   u_hwy
-        cmp  al, 2
-        je   u_park
         cmp  al, 3
         je   u_end
-        cmp  al, 4
-        je   u_gar
-        cmp  al, 5
-        je   u_pause
-        jmp  upd_menu
+        ret
 u_hwy:  jmp  upd_hwy
-u_park: jmp  upd_park
 u_end:  jmp  upd_end
-u_gar:  jmp  upd_garage
-u_pause: jmp upd_pause
 
-; set_cam: loads the numbers of the chosen camera (cam) for the world shown
+; set_cam: loads the camera numbers of the cockpit view
 set_cam:
         push ax
-        push bx
         push cx
         push si
         push di
-        xor  ah, ah
-        mov  al, [cam]
-        mov  bx, 14
-        mul  bx
         mov  si, camh_tab
-        cmp  byte [scene], 2
-        jne  sc1
-        mov  si, camp_tab
-sc1:    add  si, ax
         mov  di, cam_hi
         mov  cx, 7
 sc2:    lodsw
@@ -1469,217 +1289,7 @@ sc2:    lodsw
         pop  di
         pop  si
         pop  cx
-        pop  bx
         pop  ax
-        ret
-
-; next_cam: C key / pause menu
-next_cam:
-        mov  al, [usercam]
-        inc  al
-        cmp  al, 3
-        jb   nc1
-        xor  al, al
-nc1:    mov  [usercam], al
-        mov  [cam], al
-        call set_cam
-        mov  word [camnote], 150
-        call save_game
-        ret
-
-; apply_car: speed, acceleration, brakes and handling of the chosen car
-apply_car:
-        push ax
-        push bx
-        xor  bh, bh
-        mov  bl, [selcar]
-        mov  ax, bx
-        shl  bx, 1
-        mov  ax, [car_vmax+bx]
-        mov  [vmax], ax
-        mov  ax, [car_brk+bx]
-        mov  [brk], ax
-        mov  ax, [car_glide+bx]
-        mov  [glide], ax
-        mov  bl, [selcar]
-        xor  bh, bh
-        mov  al, [car_acc+bx]
-        mov  [accsh], al
-        pop  bx
-        pop  ax
-        ret
-
-; ---------------------------------------------------------------- menu
-upd_menu:
-        mov  word [advp], 15
-        mov  ax, [odo]
-        add  ax, 15
-        mov  [odo], ax
-        call traffic_update
-        mov  al, [lastkey]
-        mov  byte [lastkey], 0
-        cmp  al, 0x48
-        jne  um1
-        mov  al, [msel]
-        dec  al
-        and  al, 3
-        mov  [msel], al
-        ret
-um1:    cmp  al, 0x50
-        jne  um2
-        mov  al, [msel]
-        inc  al
-        and  al, 3
-        mov  [msel], al
-        ret
-um2:    cmp  al, 2
-        je   um_hwy
-        cmp  al, 3
-        je   um_park
-        cmp  al, 4
-        je   um_gar
-        cmp  al, 1
-        je   um_quit
-        cmp  al, 0x1C
-        jne  um_x
-        mov  al, [msel]
-        or   al, al
-        jz   um_hwy
-        cmp  al, 1
-        je   um_park
-        cmp  al, 2
-        je   um_gar
-um_quit:
-        mov  byte [quitflag], 1
-um_x:   ret
-um_hwy: jmp  hwy_start
-um_park: jmp park_start
-um_gar: mov  byte [state], 4
-        mov  al, [selcar]
-        mov  [gsel], al
-        mov  word [gmsg], 0
-        ret
-
-; ---------------------------------------------------------------- garage
-upd_garage:
-        cmp  word [gmsg], 0
-        je   ug0
-        dec  word [gmsg]
-ug0:    mov  al, [lastkey]
-        mov  byte [lastkey], 0
-        cmp  al, 1
-        jne  ug1
-        mov  byte [state], 0
-        ret
-ug1:    cmp  al, 0x4B
-        jne  ug2
-        mov  al, [gsel]
-        or   al, al
-        jnz  ug1a
-        mov  al, 5
-ug1a:   dec  al
-        mov  [gsel], al
-        ret
-ug2:    cmp  al, 0x4D
-        jne  ug3
-        mov  al, [gsel]
-        inc  al
-        cmp  al, 5
-        jb   ug2a
-        xor  al, al
-ug2a:   mov  [gsel], al
-        ret
-ug3:    cmp  al, 0x1C
-        je   ug4
-        cmp  al, 0x39
-        je   ug4
-        ret
-ug4:    xor  bh, bh
-        mov  bl, [gsel]
-        mov  cl, bl
-        mov  al, 1
-        shl  al, cl
-        test [unl], al
-        jnz  ug6                 ; already owned: just choose it
-        shl  bx, 1
-        mov  dx, [car_price+bx]
-        cmp  [bank], dx
-        jb   ug5
-        sub  [bank], dx          ; pay with points and unlock
-        or   [unl], al
-        jmp  ug6
-ug5:    mov  word [gmsg], 90     ; not enough points
-        ret
-ug6:    mov  al, [gsel]
-        mov  [selcar], al
-        mov  word [gmsg], 0
-        call apply_car
-        call save_game
-        ret
-
-; ------------------------------------------------------------ pause menu
-upd_pause:
-        mov  al, [lastkey]
-        mov  byte [lastkey], 0
-        cmp  al, 1
-        je   pa_resume
-        cmp  al, 0x48
-        jne  pa1
-        mov  al, [psel]
-        or   al, al
-        jnz  pa0
-        mov  al, 5
-pa0:    dec  al
-        mov  [psel], al
-        ret
-pa1:    cmp  al, 0x50
-        jne  pa2
-        mov  al, [psel]
-        inc  al
-        cmp  al, 5
-        jb   pa1a
-        xor  al, al
-pa1a:   mov  [psel], al
-        ret
-pa2:    cmp  al, 0x1C
-        je   pa_go
-        cmp  al, 0x39
-        je   pa_go
-        cmp  al, 0x4B
-        je   pa_side
-        cmp  al, 0x4D
-        je   pa_side
-        ret
-pa_side: mov  al, [psel]
-        cmp  al, 2
-        je   pa_cam
-        cmp  al, 3
-        je   pa_sm
-        ret
-pa_go:  mov  al, [psel]
-        or   al, al
-        jz   pa_resume
-        cmp  al, 1
-        je   pa_restart
-        cmp  al, 2
-        je   pa_cam
-        cmp  al, 3
-        je   pa_sm
-        jmp  menu_reset
-pa_resume:
-        mov  al, [scene]
-        mov  [state], al
-        ret
-pa_restart:
-        cmp  byte [scene], 2
-        je   pa_rp
-        jmp  hwy_start
-pa_rp:  jmp  park_start
-pa_cam: call next_cam
-        ret
-pa_sm:  xor  byte [smooth], 1
-        mov  byte [autooff], 0
-        call save_game
         ret
 
 ; ------------------------------------------------------- common physics
@@ -1788,12 +1398,11 @@ tf4:    ret
 ; --------------------------------------------------------------- highway
 hwy_start:
         mov  byte [state], 1
-        mov  byte [scene], 1
-        mov  al, [usercam]
-        mov  [cam], al
         call set_cam
-        call apply_car
         mov  word [spd], 0
+        mov  word [vmax], 2240   ; top speed 140 km/h
+        mov  byte [accsh], 7     ; acceleration
+        mov  word [brk], 24      ; braking
         mov  word [revacc], 3
         mov  word [negrev], -128
         mov  word [odo], 0
@@ -1873,32 +1482,16 @@ end_level:
         mov  byte [state], 3
         mov  word [endtimer], 72
         mov  byte [lastkey], 0
-        ; the score of the run is added to your points
-        mov  ax, [score]
-        mov  [earned], ax
-        add  ax, [bank]
-        jnc  el1
-        mov  ax, 0xFFFF
-el1:    mov  [bank], ax
-        call save_game
         ret
 
-; level_keys: ESC opens the pause menu, C changes the camera
+; level_keys: ESC leaves the game
 level_keys:
         mov  al, [lastkey]
         mov  byte [lastkey], 0
         cmp  al, 1
         jne  lk1
-        mov  byte [state], 5
-        mov  byte [psel], 0
-        ret
-lk1:    cmp  al, 0x2E
-        jne  lk2
-        call next_cam
-lk2:    cmp  word [camnote], 0
-        je   lk3
-        dec  word [camnote]
-lk3:    ret
+        mov  byte [quitflag], 1
+lk1:    ret
 
 ; Left / Right arrow: one lane per key press; the camera glides to the lane
 lane_input:
@@ -2000,252 +1593,28 @@ hc_nx:  add  si, 2
         loop hc1
 hc_end: ret
 
-; --------------------------------------------------------------- parking
-park_start:
-        mov  byte [state], 2
-        mov  byte [scene], 2
-        mov  al, [usercam]
-        mov  [cam], al
-        call set_cam
-        mov  word [spd], 0
-        mov  word [vmax], 176
-        mov  byte [accsh], 5
-        mov  word [brk], 6
-        mov  word [revacc], 2
-        mov  word [negrev], -80
-        mov  word [acc27], 0
-        mov  word [px], 100
-        mov  word [pz], 0
-        mov  word [wheel], 0
-        mov  word [score], 1000
-        mov  word [timeleft], 5400
-        mov  word [timetotal], 5400
-        mov  word [fuel], 12000
-        mov  word [fuelmax], 12000
-        mov  word [crash], 0
-        mov  word [pcool], 0
-        mov  word [sensor], 99
-        mov  byte [lastkey], 0
-        ret
-
-upd_park:
-        call level_keys
-        cmp  byte [state], 2
-        je   up0
-        ret
-up0:    call phys
-        call calc_adv
-        mov  byte [hitflag], 0
-        ; steering wheel follows the arrow keys
-        xor  bx, bx
-        cmp  byte [keys+0x4B], 0
-        je   up1
-        mov  bx, -4
-up1:    cmp  byte [keys+0x4D], 0
-        je   up2
-        mov  bx, 4
-up2:    mov  ax, [wheel]
-        cmp  ax, bx
-        jl   up3
-        jg   up4
-        jmp  up5
-up3:    inc  ax
-        jmp  up5
-up4:    dec  ax
-up5:    mov  [wheel], ax
-        ; forward / backward movement
-        mov  ax, [pz]
-        mov  [oldpz], ax
-        add  ax, [advp]
-        cmp  ax, -320
-        jge  up6
-        mov  ax, -320
-        mov  word [spd], 0
-up6:    mov  [pz], ax
-        call park_ovl
-        jnc  up7
-        mov  ax, [oldpz]
-        mov  [pz], ax
-        mov  word [spd], 0
-        mov  byte [hitflag], 1
-up7:    ; sideways movement only while the car is moving
-        cmp  word [spd], 0
-        je   up10
-        xor  byte [par], 1
-        jz   up10                ; steer every second frame
-        mov  ax, [px]
-        mov  [oldpx], ax
-        cmp  byte [keys+0x4B], 0
-        je   up8
-        dec  ax
-up8:    cmp  byte [keys+0x4D], 0
-        je   up9
-        inc  ax
-up9:    cmp  ax, 0
-        jge  up9a
-        xor  ax, ax
-up9a:   cmp  ax, 128
-        jle  up9b
-        mov  ax, 128
-up9b:   mov  [px], ax
-        call park_ovl
-        jnc  up10
-        mov  ax, [oldpx]
-        mov  [px], ax
-        mov  byte [hitflag], 1
-up10:   ; touching something costs points (not more than once in a while)
-        cmp  word [pcool], 0
-        je   up11
-        dec  word [pcool]
-up11:   cmp  byte [hitflag], 0
-        je   up12
-        cmp  word [pcool], 0
-        jne  up12
-        mov  ax, [score]
-        sub  ax, 50
-        jae  up11a
-        xor  ax, ax
-up11a:  mov  [score], ax
-        mov  word [pcool], 50
-        mov  word [crash], 90
-up12:   call park_sensor
-        call timefuel
-        ; parked: stopped completely inside the bay without touching anything
-        cmp  word [spd], 0
-        jne  up13
-        cmp  word [pz], 858
-        jl   up13
-        cmp  word [pz], 997
-        jg   up13
-        cmp  word [px], 41
-        jl   up13
-        cmp  word [px], 87
-        jg   up13
-        add  word [score], 500
-        mov  word [msg_t], s_park
-        mov  byte [msg_c], 10
-        jmp  end_level
-up13:   cmp  word [timeleft], 0
-        je   up_time
-        cmp  word [fuel], 0
-        je   up_fuel
-        ret
-up_time:
-        mov  word [msg_t], s_time
-        mov  byte [msg_c], 12
-        jmp  end_level
-up_fuel:
-        mov  word [msg_t], s_fuel
-        mov  byte [msg_c], 12
-        jmp  end_level
-
-; park_ovl: carry set when the car box overlaps an obstacle
-park_ovl:
-        push si
-        push cx
-        mov  si, pobst
-        mov  cx, 5
-po1:    mov  ax, [px]
-        add  ax, 17
-        cmp  ax, [si]
-        jle  po_n
-        mov  ax, [px]
-        sub  ax, 17
-        cmp  ax, [si+2]
-        jge  po_n
-        mov  ax, [pz]
-        cmp  ax, [si+4]
-        jle  po_n
-        sub  ax, 282
-        cmp  ax, [si+6]
-        jge  po_n
-        pop  cx
-        pop  si
-        stc
-        ret
-po_n:   add  si, 8
-        loop po1
-        pop  cx
-        pop  si
-        clc
-        ret
-
-; park_sensor: gap to the closest obstacle in decimetres (0 = touching)
-park_sensor:
-        mov  si, pobst
-        mov  cx, 5
-        mov  word [sensor], 99
-ps1:    ; gap in x
-        mov  ax, [si]
-        mov  bx, [px]
-        add  bx, 17
-        sub  ax, bx              ; x0 - (px+17)
-        mov  dx, [px]
-        sub  dx, 17
-        sub  dx, [si+2]          ; (px-17) - x1
-        cmp  dx, ax
-        jle  ps2
-        mov  ax, dx
-ps2:    cmp  ax, 0
-        jge  ps3
-        xor  ax, ax
-ps3:    mov  bx, 35
-        mul  bx
-        mov  bx, ax
-        push cx
-        mov  cl, 6
-        shr  bx, cl              ; gap x in dm
-        pop  cx
-        ; gap in z
-        mov  ax, [si+4]
-        sub  ax, [pz]            ; z0 - pz
-        mov  dx, [pz]
-        sub  dx, 282
-        sub  dx, [si+6]          ; (pz-282) - z1
-        cmp  dx, ax
-        jle  ps4
-        mov  ax, dx
-ps4:    cmp  ax, 0
-        jge  ps5
-        xor  ax, ax
-ps5:    mov  dx, 10
-        mul  dx
-        push cx
-        mov  cl, 6
-        shr  ax, cl
-        pop  cx
-        cmp  ax, bx
-        jae  ps6
-        mov  ax, bx
-ps6:    cmp  ax, [sensor]
-        jae  ps7
-        mov  [sensor], ax
-ps7:    add  si, 8
-        loop ps1
-        ret
-
 ; ----------------------------------------------------- message screen
+; ENTER plays the level again, ESC leaves
 upd_end:
         cmp  word [endtimer], 0
         je   ue1
         dec  word [endtimer]
         ret
 ue1:    mov  al, [lastkey]
+        cmp  al, 0x01
+        je   ue3
         cmp  al, 0x1C
         je   ue2
         cmp  al, 0x39
         je   ue2
-        cmp  al, 0x01
-        je   ue2
         ret
-ue2:    call menu_reset
+ue2:    jmp  hwy_start
+ue3:    mov  byte [quitflag], 1
         ret
 
 s_win:  db "LEVEL COMPLETE",0
 s_time: db "TIME IS UP",0
 s_fuel: db "OUT OF FUEL",0
-s_park: db "PARKED PERFECTLY",0
-
 ; =====================================================================
 ;                              RENDERING
 ; =====================================================================
@@ -2259,7 +1628,6 @@ g_zw: dw 0
 g_xl: dw 0
 g_xr: dw 0
 g_dw: dw 0
-g_kk: dw 0
 b_off: dw 0
 b_base: dw 0
 b_j:  dw 0
@@ -2281,23 +1649,13 @@ b_ww: dw 0
 b_wy: dw 0
 b_f:  dw 0
 b_c:  dw 0
-c_W:  dw 0
 c_H:  dw 0
-c_sh: dw 0
-c_bh: dw 0
-c_x0: dw 0
-c_ytb: dw 0
 c_xc: dw 0
 c_wc: dw 0
 c_yc: dw 0
 c_t:  dw 0
 tdone: times NC dw 0
 t_cnt: dw 0
-pdrawn: dw 0
-pp_x: dw 0
-pp_z: dw 0
-sc_t: dw 0
-
 bld_ht:  db 7,10,8,12,9,6,11,8
 bld_col: db 5,0,1,5,3,4,5,1
 sky_h:   db 10,16,8,20,12,9,18,11,15,7,19,13,9,17,10,14
@@ -2325,81 +1683,28 @@ s_120:   db "120",0
 s_160:   db "160",0
 s_e:     db "E",0
 s_f:     db "F",0
-s_p:     db "P",0
 s_s:     db "S",0
 s_d:     db "D",0
 s_r:     db "R",0
-s_sens:  db "SENSOR",0
-s_m:     db " M",0
-s_dot:   db ".",0
-s_ban:   db "PARKING * LEVEL 2",0
 s_crash: db "CRASH  -50",0
-s_camt:  db "CAMERA  ",0
-s_cam0:  db "COCKPIT",0
-s_cam1:  db "CHASE",0
-s_cam2:  db "HIGH CHASE",0
-cam_names: dw s_cam0,s_cam1,s_cam2
-s_touch: db "TOUCH  -50",0
-
-
 game_render:
-        cmp  byte [state], 4
-        jne  gr0
-        jmp  render_garage
-gr0:    cmp  byte [scene], 2
-        je   gr_p
         call render_highway
-        jmp  gr_c
-gr_p:   call render_parking
-gr_c:   cmp  byte [state], 0
-        je   gr_menu
-        cmp  byte [cam], 0
-        jne  gr_ch
         call draw_cockpit
-        jmp  gr_h
-gr_ch:  call draw_chase_hud
-gr_h:   call draw_hud
-        mov  al, [state]
-        cmp  al, 3
+        call draw_hud
+        cmp  byte [state], 3
         je   gr_end
-        cmp  al, 5
-        je   gr_pause
         cmp  word [crash], 0
-        je   gr_cn
+        je   gr_x
         test byte [crash], 8
-        jz   gr_cn
+        jz   gr_x
         mov  si, s_crash
-        cmp  byte [scene], 2
-        jne  gr_c2
-        mov  si, s_touch
-gr_c2:  mov  bx, 100
+        mov  bx, 100
         mov  dx, 66
         mov  al, 12
         mov  ah, 2
         call puts_sh
-gr_cn:  cmp  word [camnote], 0
-        je   gr_x
-        mov  si, s_camt
-        mov  bx, 112
-        mov  dx, 32
-        mov  al, 7
-        mov  ah, 1
-        call puts_sh
-        xor  bh, bh
-        mov  bl, [cam]
-        shl  bx, 1
-        mov  si, [cam_names+bx]
-        mov  bx, [t_x]
-        mov  dx, 32
-        mov  al, 14
-        mov  ah, 1
-        call puts_sh
 gr_x:   ret
-gr_menu: call draw_menu
-        ret
 gr_end: call draw_endpanel
-        ret
-gr_pause: call draw_pause
         ret
 
 ; ------------------------------------------------------------ sky
@@ -2836,44 +2141,9 @@ db_w:   RECT [c_xc],[b_wy],[b_ww],[b_wh],[c_t]
         jmp  db_fl
 db_end: ret
 
-; ------------------------------------------------------ player's car
-; (seen from behind in the chase camera)
-draw_player:
-        mov  ax, [cam_cb]
-        add  ax, 1300
-        call b_project
-        mov  ax, [b_yb]
-        mov  [dc_yb], ax
-        mov  ax, [b_lw]
-        mov  [dc_lw], ax
-        mov  ax, [wheel]
-        mov  bx, 3
-        imul bx
-        add  ax, 160
-        mov  [dc_cx], ax
-        call player_look
-        ret
-
-; player_look: shape, paint and brake lights of the car you drive
-player_look:
-        xor  bh, bh
-        mov  bl, [selcar]
-        mov  al, [car_dsgof+bx]
-        xor  ah, ah
-        mov  [dc_des], ax
-        mov  al, [car_pntof+bx]
-        xor  ah, ah
-        mov  [dc_pnt], ax
-        mov  word [dc_brk], 0
-        cmp  byte [keys+0x39], 0
-        je   pl1
-        mov  word [dc_brk], 1
-pl1:    call drawcar
-        ret
-
+; ------------------------------------------------------------ traffic
 ; traffic, drawn from the far one to the near one
 draw_traffic:
-        mov  word [pdrawn], 0
         xor  si, si
 dt0:    mov  word [tdone+si], 0
         add  si, 2
@@ -2899,20 +2169,6 @@ dt2:    add  si, 2
         mov  word [tdone+bx], 1
         mov  si, bx
         add  dx, [cam_cb]        ; distance seen from the camera
-        cmp  byte [cam], 0
-        je   dt_c
-        cmp  word [pdrawn], 0
-        jne  dt_c
-        mov  ax, [cam_cb]
-        add  ax, 1300
-        cmp  dx, ax
-        jge  dt_c
-        push si
-        push dx
-        call draw_player         ; this car is nearer than yours: yours first
-        pop  dx
-        pop  si
-        mov  word [pdrawn], 1
 dt_c:   cmp  dx, 448
         jl   dt_nx
         cmp  dx, 30000
@@ -2942,11 +2198,7 @@ dt3:    mov  [dc_cx], ax
         call drawcar
 dt_nx:  dec  word [t_cnt]
         jnz  dt_pick
-dt_end: cmp  byte [cam], 0
-        je   dt_x
-        cmp  word [pdrawn], 0
-        jne  dt_x
-        call draw_player
+dt_end:
 dt_x:   ret
 
 render_highway:
@@ -4107,8 +3359,6 @@ hd1:    mov  si, s_time_l
         mov  ah, 1
         call puts_sh
         ; distance and score
-        cmp  byte [scene], 2
-        je   hd_sc
         mov  si, s_dist
         mov  bx, 34
         mov  dx, 3
@@ -4132,7 +3382,7 @@ hd1:    mov  si, s_time_l
         mov  al, 15
         mov  ah, 1
         call puts_sh
-hd_sc:  mov  si, s_score
+        mov  si, s_score
         mov  bx, 34
         mov  dx, 13
         mov  al, 14
@@ -4181,257 +3431,14 @@ hd4:    mov  bx, [c_xc]
         inc  si
         cmp  si, 3
         jb   hd3
-        cmp  byte [scene], 2
-        jne  hd_end
-        ; parking: title pill and sensor
-        RECT 96,3,108,15,8
-        RECT 97,4,106,13,0
-        mov  si, s_ban
-        mov  bx, 99
-        mov  dx, 7
-        mov  al, 15
-        mov  ah, 1
-        call puts
-        mov  ax, 121
-        mov  bx, 128
-        mov  cx, 130
-        cmp  byte [cam], 0
-        je   sy1
-        mov  ax, 42
-        mov  bx, 49
-        mov  cx, 51
-sy1:    mov  [sens_y], ax
-        mov  [sens_y2], bx
-        mov  [sens_y3], cx
-        mov  si, s_sens
-        mov  bx, 125
-        mov  dx, [sens_y]
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        mov  ax, [sensor]
-        xor  dx, dx
-        mov  bx, 10
-        div  bx
-        push dx
-        mov  cl, 1
-        call num2str
-        mov  bx, [t_x]
-        add  bx, 6
-        mov  dx, [sens_y]
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        mov  si, s_dot
-        mov  bx, [t_x]
-        mov  dx, [sens_y]
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        pop  ax
-        mov  cl, 1
-        call num2str
-        mov  bx, [t_x]
-        mov  dx, [sens_y]
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        mov  si, s_m
-        mov  bx, [t_x]
-        mov  dx, [sens_y]
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        ; 8 sensor lamps: green, yellow, red as the car gets closer
-        mov  ax, 32
-        sub  ax, [sensor]
-        jge  sl1
-        xor  ax, ax
-sl1:    mov  cl, 2
-        shr  ax, cl
-        cmp  ax, 8
-        jbe  sl2
-        mov  ax, 8
-sl2:    mov  [c_t], ax
-        RECT 123,[sens_y2],83,9,0
-        xor  si, si
-sl3:    mov  ax, si
-        mov  bx, 10
-        mul  bx
-        add  ax, 125
-        mov  [c_xc], ax
-        mov  bx, 8
-        cmp  si, [c_t]
-        jae  sl4
-        mov  bx, 10
-        cmp  si, 3
-        jb   sl4
-        mov  bx, 14
-        cmp  si, 6
-        jb   sl4
-        mov  bx, 12
-sl4:    mov  [c_wc], bx
-        RECT [c_xc],[sens_y3],8,5,[c_wc]
-        inc  si
-        cmp  si, 8
-        jb   sl3
 hd_end: ret
 
-sens_y:  dw 121
-sens_y2: dw 128
-sens_y3: dw 130
-
-; draw_chase_hud: instruments of the chase cameras (a bar at the bottom)
-draw_chase_hud:
-        mov  word [g_y], 176
-ch1:    mov  ax, [g_y]
-        sub  ax, 176
-        shr  ax, 1
-        shr  ax, 1
-        mov  bx, 214
-        sub  bx, ax
-        mov  ax, bx
-        mov  bx, [g_y]
-        xor  cx, cx
-        mov  dx, 320
-        call span
-        inc  word [g_y]
-        cmp  word [g_y], 200
-        jb   ch1
-        RECT 0,176,320,1,221
-        ; gear
-        RECT 8,180,22,18,8
-        RECT 9,181,20,16,206
-        mov  si, s_d
-        mov  al, 10
-        cmp  word [spd], 0
-        jge  ch2
-        mov  si, s_r
-        mov  al, 12
-ch2:    mov  bx, 14
-        mov  dx, 182
-        mov  ah, 2
-        call puts
-        ; speed
-        mov  ax, [spd]
-        cmp  ax, 0
-        jge  ch3
-        neg  ax
-ch3:    mov  cl, 4
-        shr  ax, cl
-        mov  cl, 3
-        call num2str
-        mov  bx, 46
-        mov  dx, 181
-        mov  al, 14
-        mov  ah, 2
-        call puts_sh
-        mov  si, s_kmh
-        mov  bx, 86
-        mov  dx, 190
-        mov  al, 7
-        mov  ah, 1
-        call puts
-        ; fuel bar
-        mov  si, s_fuel_l
-        mov  bx, 140
-        mov  dx, 179
-        mov  al, 7
-        mov  ah, 1
-        call puts
-        RECT 140,188,94,9,8
-        RECT 141,189,92,7,206
-        mov  ax, [fuel]
-        mov  bx, 90
-        mul  bx
-        div  word [fuelmax]
-        mov  [c_t], ax
-        mov  bx, 10
-        mov  ax, [fuelmax]
-        shr  ax, 1
-        shr  ax, 1
-        cmp  [fuel], ax
-        jae  ch4
-        mov  bx, 12
-ch4:    mov  [c_wc], bx
-        RECT 142,190,[c_t],5,[c_wc]
-        ; indicators
-        mov  al, 2
-        cmp  word [wheel], 0
-        jge  ch5
-        mov  al, 10
-ch5:    mov  si, bmp_larr
-        mov  bx, 246
-        mov  dx, 182
-        call drawbmp
-        mov  al, 2
-        cmp  word [wheel], 0
-        jle  ch6
-        mov  al, 10
-ch6:    mov  si, bmp_rarr
-        mov  bx, 286
-        mov  dx, 182
-        call drawbmp
-        mov  al, 4
-        cmp  word [crash], 0
-        je   ch7
-        test byte [crash], 8
-        jz   ch7
-        mov  al, 12
-ch7:    mov  si, bmp_haz
-        mov  bx, 266
-        mov  dx, 180
-        call drawbmp
-        ret
-s_fuel_l: db "FUEL",0
-
 ; =====================================================================
-;              PARKING LOT, MENUS, GARAGE  (smooth gradient panels)
+;              GRADIENT PANELS  (message box)
 ; =====================================================================
-tree_y: db 52,48,55,50,53,47,54,51,49,55
 cor_tab: db 5,3,2,1,1
-car_stats: db 36,30,30,34,  44,32,34,36,  54,48,44,42,  44,34,34,24,  60,58,56,50
-s_title: db "DR. DRIVING",0
-s_lite:  db "LITE",0
-s_sub:   db "COAL FINAL PROJECT",0
-s_o1:    db "HIGHWAY",0
-s_o2:    db "PARKING",0
-s_o3:    db "GARAGE",0
-s_o4:    db "QUIT",0
-s_menu_h: db "UP DOWN ENTER  OR 1 2 3",0
-s_points: db "POINTS ",0
-s_carl:   db "CAR  ",0
-s_enter: db "PRESS ENTER",0
+s_again: db "ENTER PLAY AGAIN   ESC QUIT",0
 s_scorel: db "SCORE ",0
-s_total:  db "TOTAL POINTS ",0
-s_newcar: db "NEW CAR AVAILABLE IN THE GARAGE",0
-s_paused: db "PAUSED",0
-s_p0: db "RESUME",0
-s_p1: db "RESTART",0
-s_p2: db "CAMERA",0
-s_p3: db "SMOOTH EDGES",0
-s_p4: db "MAIN MENU",0
-s_on: db "ON",0
-s_off: db "OFF",0
-s_pause_h: db "ESC RESUME   C CAMERA",0
-s_garage: db "GARAGE",0
-s_gh:     db "LEFT RIGHT CHOOSE  ENTER SELECT  ESC BACK",0
-s_owned:  db "OWNED",0
-s_sel:    db "SELECTED",0
-s_lock:   db "LOCKED  PRICE ",0
-s_nopts:  db "NOT ENOUGH POINTS",0
-s_st0: db "SPEED",0
-s_st1: db "ACCEL",0
-s_st2: db "BRAKES",0
-s_st3: db "GRIP",0
-st_names: dw s_st0,s_st1,s_st2,s_st3
-cn0: db "CITY HATCH",0
-cn1: db "SEDAN S",0
-cn2: db "COUPE R",0
-cn3: db "TREK SUV",0
-cn4: db "SUPER GT",0
-car_names: dw cn0,cn1,cn2,cn3,cn4
-
 ; ------------------------------------------------- gradient panels
 ; rbox: push x, y, w, h, top colour, bottom colour  - rounded, gradient
 rbox:   push bp
@@ -4493,6 +3500,7 @@ rb3:    mov  ax, [bp+4]
         PUSHV %6
         call rbox
 %endmacro
+
 ; a panel: gold frame, dark blue gradient inside
 %macro PANEL 4
         RBOX %1-2,%2-2,%3+4,%4+4,233,227
@@ -4531,7 +3539,6 @@ putsc:  push bx
         pop  bx
         ret
 
-
 ; mkline: si = label text, ax = number  ->  si = "label number" (one string)
 mkline: push ax
         push bx
@@ -4559,835 +3566,29 @@ mk3:    mov  bl, [si]
         ret
 linebuf: times 40 db 0
 
-; goldtext: three layers (shadow, dark gold, bright gold) - elegant title
-goldtext:
-        push ax
-        push bx
-        push dx
-        add  bx, 2
-        add  dx, 2
-        mov  al, 0
-        call puts
-        pop  dx
-        pop  bx
-        push bx
-        push dx
-        inc  bx
-        inc  dx
-        mov  al, 229
-        call puts
-        pop  dx
-        pop  bx
-        pop  ax
-        mov  al, 233
-        call puts
-        ret
-
-; ------------------------------------------------------------ parking
-; bayx: ax = world x  ->  ax = screen x at the current row (uses [px], [g_lw])
-bayx:   sub  ax, [px]
-        imul word [g_lw]
-        mov  cl, 6
-        sar  ax, cl
-        add  ax, 160
-        ret
-
-draw_sky_park:
-        mov  cx, 80
-        call skyrows
-        mov  bx, 36
-        mov  dx, 24
-        call cloud
-        mov  bx, 215
-        mov  dx, 34
-        call cloud
-        ; row of trees behind the fence
-        xor  si, si
-tp1:    mov  ax, si
-        mov  bx, 34
-        mul  bx
-        sub  ax, 6
-        mov  [c_xc], ax
-        xor  ax, ax
-        mov  al, [tree_y+si]
-        mov  [c_yc], ax
-        mov  bx, 80
-        sub  bx, ax
-        mov  [c_wc], bx
-        RECT [c_xc],[c_yc],40,[c_wc],2
-        mov  ax, [c_xc]
-        add  ax, 3
-        mov  [c_xc], ax
-        RECT [c_xc],[c_yc],34,5,10
-        inc  si
-        cmp  si, 10
-        jb   tp1
-        ; concrete fence
-        RECT 0,80,320,8,219
-        RECT 0,80,320,1,15
-        RECT 0,87,320,1,212
-        xor  si, si
-tp2:    mov  ax, si
-        mov  cl, 4
-        shl  ax, cl
-        mov  [c_xc], ax
-        RECT [c_xc],81,2,6,210
-        inc  si
-        cmp  si, 20
-        jb   tp2
-        ret
-
-draw_ground_park:
-        mov  word [g_y], 88
-gp_row: mov  ax, [g_y]
-        sub  ax, 87
-        mov  [g_k], ax
-        mul  word [cam_lwm]
-        mov  cl, 3
-        shr  ax, cl
-        add  ax, [cam_lwa]
-        mov  [g_lw], ax
-        mov  bx, [g_k]
-        cmp  bx, [cam_kmin]
-        jae  gp0
-        mov  bx, [cam_kmin]
-gp0:    mov  dx, [cam_hi]
-        mov  ax, [cam_lo]
-        div  bx
-        add  ax, [pz]
-        sub  ax, 115
-        sub  ax, [cam_cb]
-        mov  [g_zw], ax
-        mov  bx, [g_y]
-        mov  ax, [g_k]
-        shr  ax, 1
-        shr  ax, 1
-        cmp  ax, 23
-        jbe  gp1a
-        mov  ax, 23
-gp1a:   add  ax, 38
-        xor  cx, cx
-        mov  dx, 320
-        call span
-        mov  ax, [g_zw]
-        cmp  ax, 576
-        jl   gp_nx
-        cmp  ax, 1030
-        jg   gp_nx
-        mov  ax, [g_lw]
-        mov  cl, 5
-        shr  ax, cl
-        inc  ax
-        mov  [g_ew], ax
-        cmp  word [g_zw], 992
-        jge  gp_curb
-        ; bay: green floor, white lines
-        mov  ax, 24
-        call bayx
-        mov  [g_xl], ax
-        mov  ax, 104
-        call bayx
-        mov  [g_xr], ax
-        mov  bx, [g_y]
-        mov  al, 2
-        mov  cx, [g_xl]
-        mov  dx, [g_xr]
-        call span
-        mov  al, 15
-        mov  cx, [g_xl]
-        mov  dx, cx
-        add  dx, [g_ew]
-        call span
-        mov  dx, [g_xr]
-        mov  cx, dx
-        sub  cx, [g_ew]
-        call span
-        cmp  word [g_zw], 616
-        jge  gp2
-        mov  cx, [g_xl]
-        mov  dx, [g_xr]
-        call span
-gp2:    mov  ax, -56
-        call bayx
-        mov  cx, ax
-        mov  dx, ax
-        add  dx, [g_ew]
-        mov  al, 15
-        call span
-        mov  ax, 184
-        call bayx
-        mov  cx, ax
-        mov  dx, ax
-        add  dx, [g_ew]
-        mov  al, 15
-        call span
-        jmp  gp_nx
-gp_curb:
-        mov  ax, -60
-        call bayx
-        push ax
-        mov  ax, 190
-        call bayx
-        mov  dx, ax
-        pop  cx
-        mov  bx, [g_y]
-        mov  al, 14
-        call span
-gp_nx:  inc  word [g_y]
-        mov  ax, [cam_gnd]
-        cmp  [g_y], ax
-        jae  gp_dn
-        jmp  gp_row
-gp_dn:  ret
-
-; park_zproj: bx = distance seen from the camera
-;             -> g_k, g_lw, dc_yb ; carry set when not visible
-park_zproj:
-        cmp  bx, 200
-        jl   pj_no
-        mov  dx, [cam_hi]
-        mov  ax, [cam_lo]
-        cmp  dx, bx
-        jae  pj_no
-        div  bx
-        cmp  ax, 1
-        jl   pj_no
-        mov  [g_k], ax
-        add  ax, 87
-        mov  [dc_yb], ax
-        mov  ax, [g_k]
-        mul  word [cam_lwm]
-        mov  cl, 3
-        shr  ax, cl
-        add  ax, [cam_lwa]
-        mov  [g_lw], ax
-        clc
-        ret
-pj_no:  stc
-        ret
-
-; park_proj: [pp_x] = world x, [pp_z] = world z -> dc_cx, dc_yb, g_lw
-park_proj:
-        mov  bx, [pp_z]
-        sub  bx, [pz]
-        add  bx, 115
-        add  bx, [cam_cb]
-        call park_zproj
-        jc   pj_x
-        mov  ax, [pp_x]
-        call bayx
-        mov  [dc_cx], ax
-        clc
-pj_x:   ret
-
-pp_pnt: dw 0
-pp_des: dw 0
-
-; a parked car seen from behind
-park_car:
-        call park_proj
-        jc   pc_x
-        mov  ax, [g_lw]
-        mov  bx, ax
-        shl  ax, 1
-        shl  ax, 1
-        add  ax, bx
-        mov  cl, 3
-        shr  ax, cl
-        mov  [dc_lw], ax
-        mov  ax, [pp_pnt]
-        mov  [dc_pnt], ax
-        mov  ax, [pp_des]
-        mov  [dc_des], ax
-        mov  word [dc_brk], 0
-        call drawcar
-pc_x:   ret
-
-; the car you drive, in the chase cameras
-draw_player_park:
-        mov  bx, [cam_cb]
-        sub  bx, 167
-        call park_zproj
-        jc   dpp_x
-        mov  ax, [g_lw]
-        mov  bx, ax
-        shl  ax, 1
-        shl  ax, 1
-        add  ax, bx
-        mov  cl, 3
-        shr  ax, cl
-        mov  [dc_lw], ax
-        mov  ax, [wheel]
-        mov  bx, 3
-        imul bx
-        add  ax, 160
-        mov  [dc_cx], ax
-        call player_look
-dpp_x:  mov  word [pdrawn], 1
-        ret
-
-; draws your car first if the next object is nearer than it: ax = object z
-maybe_player:
-        cmp  byte [cam], 0
-        je   mp_x
-        cmp  word [pdrawn], 0
-        jne  mp_x
-        mov  bx, [pz]
-        sub  bx, 282
-        cmp  bx, ax
-        jle  mp_x
-        call draw_player_park
-mp_x:   ret
-
-; traffic cone
-park_cone:
-        call park_proj
-        jc   pk_x
-        mov  ax, [g_lw]
-        mov  bx, ax
-        shl  ax, 1
-        add  ax, bx
-        mov  cl, 4
-        shr  ax, cl              ; height
-        cmp  ax, 4
-        jae  pk1
-        mov  ax, 4
-pk1:    mov  [c_H], ax
-        mov  cl, 2
-        shr  ax, cl
-        mov  [c_sh], ax          ; height of one step
-        mov  ax, [c_H]
-        shr  ax, 1
-        shr  ax, 1
-        shr  ax, 1
-        cmp  ax, 1
-        jae  pk2
-        mov  ax, 1
-pk2:    mov  [c_bh], ax          ; base plate
-        xor  si, si
-pk3:    mov  ax, si
-        inc  ax
-        mul  word [c_H]
-        mov  cl, 2
-        shr  ax, cl
-        inc  ax
-        mov  [c_W], ax           ; width of this step
-        shr  ax, 1
-        mov  bx, [dc_cx]
-        sub  bx, ax
-        mov  [c_x0], bx
-        mov  ax, si
-        mul  word [c_sh]
-        mov  bx, [dc_yb]
-        sub  bx, [c_H]
-        sub  bx, [c_bh]
-        add  bx, ax
-        mov  [c_ytb], bx
-        mov  ax, 12
-        cmp  si, 1
-        jne  pk4
-        mov  ax, 15
-pk4:    mov  [c_t], ax
-        RECT [c_x0],[c_ytb],[c_W],[c_sh],[c_t]
-        inc  si
-        cmp  si, 4
-        jb   pk3
-        mov  ax, [c_H]
-        mov  cl, 2
-        shr  ax, cl
-        add  ax, [c_H]
-        mov  [c_W], ax
-        shr  ax, 1
-        mov  bx, [dc_cx]
-        sub  bx, ax
-        mov  [c_x0], bx
-        mov  ax, [dc_yb]
-        sub  ax, [c_bh]
-        mov  [c_ytb], ax
-        RECT [c_x0],[c_ytb],[c_W],[c_bh],206
-pk_x:   ret
-
-draw_park_objects:
-        mov  word [pdrawn], 0
-        ; big letter P in the bay
-        mov  bx, 899
-        sub  bx, [pz]
-        add  bx, [cam_cb]        ; distance to the middle of the bay
-        cmp  bx, 300
-        jl   dpo1
-        mov  dx, [cam_hi]
-        cmp  dx, bx
-        jae  dpo1
-        mov  ax, [cam_lo]
-        div  bx
-        cmp  ax, 70
-        jg   dpo1
-        mov  [g_k], ax
-        add  ax, 87
-        mov  [dc_yb], ax
-        mov  ax, [g_k]
-        mul  word [cam_lwm]
-        mov  cl, 3
-        shr  ax, cl
-        add  ax, [cam_lwa]
-        mov  [g_lw], ax
-        mov  ax, 64
-        call bayx
-        mov  [dc_cx], ax
-        mov  ah, 3
-        cmp  word [g_k], 30
-        jge  dpo2
-        mov  ah, 2
-        cmp  word [g_k], 14
-        jge  dpo2
-        mov  ah, 1
-dpo2:   cmp  byte [cam], 0
-        je   dpo3
-        mov  ah, 1               ; chase cameras see the bay flat: small letter
-dpo3:   mov  [t_sc], ah
-        xor  ah, ah
-        mov  al, [t_sc]
-        mov  bx, 3
-        mul  bx
-        mov  bx, [dc_cx]
-        sub  bx, ax
-        mov  dx, [dc_yb]
-        sub  dx, ax
-        mov  si, s_p
-        mov  al, 15
-        mov  ah, [t_sc]
-        call puts
-dpo1:   ; far parked cars
-        mov  word [pp_x], 0
-        mov  word [pp_z], 2300
-        mov  word [pp_pnt], 2
-        mov  word [pp_des], 1
-        call park_car
-        mov  word [pp_x], 116
-        mov  word [pp_z], 2700
-        mov  word [pp_pnt], 5
-        mov  word [pp_des], 0
-        call park_car
-        mov  word [pp_x], -70
-        mov  word [pp_z], 2500
-        mov  word [pp_pnt], 4
-        mov  word [pp_des], 2
-        call park_car
-        mov  word [pp_x], 60
-        mov  word [pp_z], 3000
-        mov  word [pp_pnt], 1
-        mov  word [pp_des], 3
-        call park_car
-        mov  word [pp_x], 170
-        mov  word [pp_z], 2400
-        mov  word [pp_pnt], 3
-        mov  word [pp_des], 4
-        call park_car
-        ; neighbours of the bay
-        mov  ax, 595
-        call maybe_player
-        mov  word [pp_x], -16
-        mov  word [pp_z], 595
-        mov  word [pp_pnt], 5
-        mov  word [pp_des], 1
-        call park_car
-        mov  word [pp_x], 144
-        mov  word [pp_z], 595
-        mov  word [pp_pnt], 2
-        mov  word [pp_des], 3
-        call park_car
-        ; cones at the bay entrance
-        mov  ax, 576
-        call maybe_player
-        mov  word [pp_x], 20
-        mov  word [pp_z], 576
-        call park_cone
-        mov  word [pp_x], 108
-        mov  word [pp_z], 576
-        call park_cone
-        cmp  byte [cam], 0
-        je   dpo9
-        cmp  word [pdrawn], 0
-        jne  dpo9
-        call draw_player_park
-dpo9:   ret
-
-render_parking:
-        call draw_sky_park
-        call draw_ground_park
-        call draw_park_objects
-        ret
-
-; ------------------------------------------------------------ main menu
-; menu_item: si = text, dx = y, al = item number
-menu_item:
-        push ax
-        push bx
-        push dx
-        cmp  al, [msel]
-        jne  mi1
-        mov  [c_t], dx
-        RBOX 84,[c_t],152,17,243,238
-        pop  dx
-        pop  bx
-        pop  ax
-        push ax
-        push bx
-        push dx
-        mov  al, 233
-        jmp  mi2
-mi1:    mov  al, 7
-mi2:    mov  bx, 112
-        add  dx, 2
-        mov  ah, 2
-        call puts_sh
-        pop  dx
-        pop  bx
-        pop  ax
-        ret
-
-draw_menu:
-        PANEL 60,24,200,166
-        mov  si, s_title
-        mov  bx, 62
-        mov  dx, 32
-        mov  al, 233
-        mov  ah, 3
-        call goldtext
-        mov  si, s_lite
-        mov  bx, 137
-        mov  dx, 56
-        mov  ah, 2
-        call goldtext
-        mov  si, s_sub
-        mov  dx, 76
-        mov  al, 7
-        mov  ah, 1
-        call putsc
-        RECT 84,88,152,1,230
-        mov  si, s_o1
-        mov  dx, 94
-        xor  al, al
-        call menu_item
-        mov  si, s_o2
-        mov  dx, 112
-        mov  al, 1
-        call menu_item
-        mov  si, s_o3
-        mov  dx, 130
-        mov  al, 2
-        call menu_item
-        mov  si, s_o4
-        mov  dx, 148
-        mov  al, 3
-        call menu_item
-        ; points and chosen car
-        mov  si, s_points
-        mov  bx, 70
-        mov  dx, 170
-        mov  al, 233
-        mov  ah, 1
-        call puts_sh
-        mov  ax, [bank]
-        mov  cl, 1
-        call num2str
-        mov  bx, [t_x]
-        mov  dx, 170
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        xor  bh, bh
-        mov  bl, [selcar]
-        shl  bx, 1
-        mov  si, [car_names+bx]
-        mov  bx, 180
-        mov  dx, 170
-        mov  al, 14
-        mov  ah, 1
-        call puts_sh
-        mov  si, s_menu_h
-        mov  dx, 180
-        mov  al, 8
-        mov  ah, 1
-        call putsc
-        ret
-
-; ----------------------------------------------------------- pause menu
-pause_item:
-        push ax
-        push bx
-        push dx
-        cmp  al, [psel]
-        jne  pi1
-        mov  [c_t], dx
-        RBOX 94,[c_t],132,14,243,238
-pi1:    pop  dx
-        pop  bx
-        pop  ax
-        push ax
-        push bx
-        push dx
-        mov  bx, 102
-        add  dx, 3
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        pop  dx
-        pop  bx
-        pop  ax
-        ret
-
-draw_pause:
-        PANEL 80,36,160,132
-        mov  si, s_paused
-        mov  dx, 44
-        mov  al, 233
-        mov  ah, 2
-        call putsc
-        mov  si, s_p0
-        mov  dx, 70
-        xor  al, al
-        call pause_item
-        mov  si, s_p1
-        mov  dx, 86
-        mov  al, 1
-        call pause_item
-        mov  si, s_p2
-        mov  dx, 102
-        mov  al, 2
-        call pause_item
-        xor  bh, bh
-        mov  bl, [cam]
-        shl  bx, 1
-        mov  si, [cam_names+bx]
-        mov  bx, 168
-        mov  dx, 105
-        mov  al, 14
-        mov  ah, 1
-        call puts
-        mov  si, s_p3
-        mov  dx, 118
-        mov  al, 3
-        call pause_item
-        mov  si, s_on
-        cmp  byte [smooth], 0
-        jne  dp1
-        mov  si, s_off
-dp1:    mov  bx, 200
-        mov  dx, 121
-        mov  al, 14
-        mov  ah, 1
-        call puts
-        mov  si, s_p4
-        mov  dx, 134
-        mov  al, 4
-        call pause_item
-        mov  si, s_pause_h
-        mov  dx, 156
-        mov  al, 8
-        mov  ah, 1
-        call putsc
-        ret
-
 ; ------------------------------------------------------------ end panel
 draw_endpanel:
-        PANEL 50,50,220,104
+        PANEL 50,60,220,80
         mov  si, [msg_t]
-        mov  dx, 60
+        mov  dx, 72
         mov  al, [msg_c]
         mov  ah, 2
         call putsc
         mov  si, s_scorel
-        mov  ax, [earned]
+        mov  ax, [score]
         call mkline
-        mov  dx, 86
+        mov  dx, 98
         mov  al, 14
         mov  ah, 2
         call putsc
-        mov  si, s_total
-        mov  ax, [bank]
-        call mkline
-        mov  dx, 108
-        mov  al, 233
-        mov  ah, 1
-        call putsc
-        ; is there a car you can afford now?
-        xor  si, si
-ep1:    mov  al, 1
-        mov  cx, si
-        shl  al, cl
-        test [unl], al
-        jnz  ep2
-        mov  bx, si
-        shl  bx, 1
-        mov  ax, [bank]
-        cmp  ax, [car_price+bx]
-        jb   ep2
-        mov  si, s_newcar
-        mov  dx, 122
-        mov  al, 10
-        mov  ah, 1
-        call putsc
-        jmp  ep3
-ep2:    inc  si
-        cmp  si, 5
-        jb   ep1
-ep3:    test byte [ticks], 32
+        test byte [ticks], 32
         jz   ep9
-        mov  si, s_enter
-        mov  dx, 138
+        mov  si, s_again
+        mov  dx, 122
         mov  al, 7
         mov  ah, 1
         call putsc
 ep9:    ret
-
-; ------------------------------------------------------------- garage
-render_garage:
-        ; background: deep blue gradient
-        xor  bx, bx
-rg1:    mov  ax, bx
-        mov  cl, 4
-        shr  ax, cl
-        add  ax, 234
-        xor  cx, cx
-        mov  dx, 320
-        call span
-        inc  bx
-        cmp  bx, 200
-        jb   rg1
-        mov  si, s_garage
-        mov  dx, 8
-        mov  al, 233
-        mov  ah, 2
-        call putsc
-        ; points
-        mov  si, s_points
-        mov  bx, 214
-        mov  dx, 10
-        mov  al, 233
-        mov  ah, 1
-        call puts_sh
-        mov  ax, [bank]
-        mov  cl, 1
-        call num2str
-        mov  bx, [t_x]
-        mov  dx, 10
-        mov  al, 15
-        mov  ah, 1
-        call puts_sh
-        ; spot light and podium
-        RBOX 70,150,180,16,222,214
-        RBOX 70,148,180,3,230,233
-        xor  bh, bh
-        mov  bl, [gsel]
-        mov  al, [car_dsgof+bx]
-        xor  ah, ah
-        mov  [dc_des], ax
-        mov  al, [car_pntof+bx]
-        xor  ah, ah
-        mov  [dc_pnt], ax
-        mov  word [dc_brk], 0
-        mov  word [dc_cx], 160
-        mov  word [dc_yb], 146
-        mov  word [dc_lw], 150
-        call drawcar
-        ; arrows
-        mov  si, s_larr
-        mov  bx, 16
-        mov  dx, 100
-        mov  al, 233
-        mov  ah, 3
-        call puts_sh
-        mov  si, s_rarr
-        mov  bx, 288
-        mov  dx, 100
-        mov  al, 233
-        mov  ah, 3
-        call puts_sh
-        ; name
-        xor  bh, bh
-        mov  bl, [gsel]
-        shl  bx, 1
-        mov  si, [car_names+bx]
-        mov  dx, 172
-        mov  al, 15
-        mov  ah, 2
-        call putsc
-        ; stats
-        xor  di, di
-rg2:    mov  ax, di
-        mov  bx, 11
-        mul  bx
-        add  ax, 36
-        mov  [c_yc], ax
-        mov  bx, di
-        shl  bx, 1
-        mov  si, [st_names+bx]
-        mov  bx, 8
-        mov  dx, [c_yc]
-        mov  al, 7
-        mov  ah, 1
-        call puts_sh
-        RECT 46,[c_yc],54,6,236
-        xor  bh, bh
-        mov  bl, [gsel]
-        shl  bx, 1
-        shl  bx, 1
-        add  bx, di
-        xor  ah, ah
-        mov  al, [car_stats+bx]
-        mov  [c_t], ax
-        mov  ax, [c_yc]
-        inc  ax
-        mov  [c_wc], ax
-        RECT 47,[c_wc],[c_t],4,232
-        inc  di
-        cmp  di, 4
-        jb   rg2
-        ; status line
-        mov  al, 1
-        mov  cl, [gsel]
-        shl  al, cl
-        test [unl], al
-        jnz  rg3
-        mov  si, s_lock
-        xor  bh, bh
-        mov  bl, [gsel]
-        shl  bx, 1
-        mov  ax, [car_price+bx]
-        call mkline
-        mov  dx, 188
-        mov  al, 12
-        mov  ah, 1
-        call putsc
-        jmp  rg5
-rg3:    mov  si, s_owned
-        mov  al, [gsel]
-        cmp  al, [selcar]
-        jne  rg4
-        mov  si, s_sel
-rg4:    mov  dx, 188
-        mov  al, 10
-        mov  ah, 1
-        call putsc
-rg5:    cmp  word [gmsg], 0
-        je   rg6
-        test byte [ticks], 8
-        jz   rg6
-        mov  si, s_nopts
-        mov  dx, 124
-        mov  al, 12
-        mov  ah, 2
-        call putsc
-rg6:    mov  si, s_gh
-        mov  dx, 24
-        mov  al, 8
-        mov  ah, 1
-        call putsc
-        ret
-s_larr: db "<",0
-s_rarr: db ">",0
-
 
 ; =====================================================================
 ;                         LOOK-UP TABLES
